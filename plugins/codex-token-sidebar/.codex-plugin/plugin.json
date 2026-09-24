@@ -1,0 +1,19 @@
+{
+  "name": "codex-token-sidebar",
+  "version": "0.1.0+codex.20260924030200",
+  "description": "\u5728 Codex Desktop \u7684 pinned summary \u4fa7\u8fb9\u680f\u663e\u793a\u5f53\u524d\u4f1a\u8bdd Token \u7528\u91cf\u3002",
+  "author": {
+    "name": "Stephen"
+  },
+  "interface": {
+    "displayName": "Codex Token Sidebar",
+    "shortDescription": "\u5728 Codex \u4fa7\u680f\u67e5\u770b\u4f1a\u8bdd\u4e0e\u6a21\u578b Token \u7528\u91cf\u3002",
+    "longDescription": "\u8bfb\u53d6\u5f53\u524d Codex \u4f1a\u8bdd\u7684\u672c\u5730\u7528\u91cf\u6570\u636e\uff0c\u5e76\u901a\u8fc7 loopback CDP \u5728 Codex Desktop pinned summary \u4fa7\u680f\u663e\u793a\u5f53\u524d\u4f1a\u8bdd\u548c\u4f1a\u8bdd\u5185\u6309\u6a21\u578b\u805a\u5408\u7684 Token \u7528\u91cf\u3002\u63d2\u4ef6\u4e0d\u626b\u63cf\u5168\u90e8\u5386\u53f2\u4f1a\u8bdd\uff0c\u4e0d\u4ee3\u7406\u6a21\u578b\u8bf7\u6c42\uff0c\u4e5f\u4e0d\u521b\u5efa\u72ec\u7acb Dashboard\u3002",
+    "developerName": "Stephen",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "\u68c0\u67e5 Codex Token Sidebar \u7684\u672c\u5730\u4f1a\u8bdd\u7528\u91cf\u3002"
+    ]
+  }
+}

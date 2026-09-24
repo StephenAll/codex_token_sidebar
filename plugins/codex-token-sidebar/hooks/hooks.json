@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/bin/zsh \"$PLUGIN_ROOT/scripts/start_sidebar.sh\" --background >/dev/null",
+            "commandWindows": "py -3 -c \"import os,runpy,sys;p=os.path.join(os.environ['PLUGIN_ROOT'],'runtime','windows_lifecycle.py');sys.path.insert(0,os.path.dirname(p));sys.argv=[p,'start'];runpy.run_path(p,run_name='__main__')\"",
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

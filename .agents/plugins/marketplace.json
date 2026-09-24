@@ -1,0 +1,20 @@
+{
+  "name": "stephen",
+  "interface": {
+    "displayName": "Stephen"
+  },
+  "plugins": [
+    {
+      "name": "codex-token-sidebar",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-token-sidebar"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

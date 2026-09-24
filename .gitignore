@@ -1,0 +1,21 @@
+# Python bytecode and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments and packaging output
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Editor and operating-system files
+.DS_Store
+*.swp
+
+# Local diagnostics
+*.log
+.local/

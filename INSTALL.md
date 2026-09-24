@@ -1,6 +1,6 @@
 # Codex Token Sidebar：Agent 安装入口
 
-先判断 **Codex Desktop 所在电脑的操作系统**。仓库应已克隆，当前目录为包含 `.agents/plugins/marketplace.json` 的仓库根目录。
+先判断 **Codex Desktop 所在电脑的操作系统**。源码应已克隆或解压，当前目录为包含 `.agents/plugins/marketplace.json` 的项目根目录。
 
 Windows Desktop 若把 Agent 配置为 WSL，先在 Desktop 设置中将 **Agent environment** 切换到 **Windows native** 并重启，再进入 Windows 路线。以 Desktop 宿主平台判定路线；WSL 内的 `platform.system()` 返回 Linux 不能代表宿主平台。
 

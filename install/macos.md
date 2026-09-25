@@ -24,7 +24,7 @@
    - **2 外部 Terminal 命令：** Agent 运行 `python3 scripts/setup_macos_cdp.py terminal`；应用不在默认路径时同样传 `--app`。它在用户的 zsh 或 bash 启动文件中添加 `codex-cdp` 命令；请用户以后在**新的外部 Terminal** 运行该命令。
    - **用户自行描述：** 按其启动习惯设置等效方式；必须以 `--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1` 启动 Desktop，并完成下述验收。无法实现时说明原因，请用户改选 1 或 2。
 
-   当前 Desktop 未以 CDP 方式运行时，请用户**完全退出**后按所选方式重开；集成终端会随 Desktop 退出，不能用它执行重启命令。若 Desktop 设为开机自动启动，也应改用所选入口，避免普通启动抢先占用进程。重开后由 Agent 复查 `/json/list` 中的 Desktop 主页面；若未出现，先核对是否从所选入口启动，再继续下一步。
+   上述脚本只配置启动入口，不会改变已运行的 Desktop。请用户**完全退出**后按所选方式重开；集成终端会随 Desktop 退出，不能用它执行重启命令。若 Desktop 设为开机自动启动，也应改用所选入口，避免普通启动抢先占用进程。重开后由 Agent 复查 `/json/list` 中的 Desktop 主页面；若未出现，先核对是否从所选入口启动，再继续下一步。
 
 3. **触发并验收 Hook。** 先运行 `plugins/codex-token-sidebar/scripts/stop_sidebar.sh --json`，避免旧实例掩盖启动失败。请用户新建 Codex 任务；若出现 `codex-token-sidebar@stephen` 的 Hook 审查提示，由用户确认信任后再新建任务。选中已有用量的任务，检查侧栏和状态：
 

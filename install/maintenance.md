@@ -53,7 +53,7 @@
 
 ## 卸载
 
-只在用户要求卸载时执行。先停止侧栏运行时并确认 `status=stopped`，再移除插件。macOS：
+只在用户要求卸载时执行。保留项目目录直到插件和 CDP 入口均清理完成。先停止侧栏运行时并确认 `status=stopped`，再移除插件。macOS：
 
 ```sh
 plugins/codex-token-sidebar/scripts/stop_sidebar.sh --json
@@ -72,4 +72,6 @@ py -3 plugins/codex-token-sidebar/runtime/windows_lifecycle.py stop --json
 若安装时为本插件配置了固定 CDP 启动入口，再清理该入口：
 
 - **macOS：** `~/Applications/Codex CDP.app` 仅在 `Contents/Resources/codex-token-sidebar-launcher.txt` 标记存在且确认是本项目生成的启动器时删除。终端路线仅从相应 shell 配置文件中删除 `# >>> Codex Token Sidebar CDP >>>` 到 `# <<< Codex Token Sidebar CDP <<<` 的完整区块；保留其他配置和原始 Desktop 应用。
-- **Windows：** 先读取 `%LOCALAPPDATA%\Codex Token Sidebar\CDP\setup-state.json`。仅删除路径及 SHA-256 与记录一致的桌面 `Codex CDP.lnk`、目录内的 `codex-cdp.cmd` 和 `codex_cdp.py`；终端路线还要从当前用户的 Path 中移除记录的 `CDP` 目录。确认 `launch.log` 是本工具生成的日志后清理，再删除状态文件；若文件已变化或无法核对，保留并报告，不删除其他内容。
+- **Windows：** Agent 定位项目根目录的 `Uninstall Codex CDP.cmd`，请用户亲自在资源管理器中双击，停在此步等待结果。与安装一样，清理必须发生在外部桌面环境；Agent 不在内部终端代跑 CMD 或底层 Python 命令。脚本核对安装记录后删除本工具的桌面快捷方式、支持脚本、日志和状态文件；终端路线还会移除其用户 Path 项，其他文件保留。若记录缺失或文件不匹配，窗口明确报错并保留文件，由 Agent 核对归属后处理。
+
+Windows 卸载完成条件：插件列表已无该插件，用户确认外部卸载窗口显示 `CDP launcher removal completed`，并确认桌面 `Codex CDP` 快捷方式已消失。未取得外部结果时只报告“插件已移除，CDP 入口清理待完成”。移除快捷方式不会改变当前 Codex 进程的启动参数；需要结束当前 CDP 监听时，请用户完全退出 Codex 后从原始应用入口启动。

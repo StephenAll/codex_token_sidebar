@@ -6,7 +6,7 @@
 py -3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 ```
 
-若失败，先让用户在正常 Windows 环境中安装 Python 3.10+，重启 Desktop，再由 Agent 重试；Hook 也依赖这个命令。桌面启动器的双击安装入口会自行检查用户侧的 Python。
+若失败，先让用户在正常 Windows 环境中安装 Python 3.10+，重启 Desktop，再由 Agent 重试；Hook 也依赖这个命令。
 
 1. **安装插件。** 依次检查显式配置的 `CODEX_CLI_PATH`、Desktop 包内 CLI 和正在运行的 app-server CLI，选用当前 Agent 可执行的文件。整块命令在同一次 PowerShell 调用中运行，不写死缓存路径。
 
@@ -61,7 +61,9 @@ py -3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 
    用户尚未说明启动偏好时，只问一次：「以后你想怎样启动带 CDP 的 Codex？回复 **1 桌面启动器（推荐）**、**2 外部 PowerShell 命令**，或直接描述你希望的其他方式。」确定选择后执行对应路线。
 
-   - **1 桌面启动器：** Agent 定位项目根目录的 `Install Codex CDP.cmd`，优先用已有的桌面操作能力在资源管理器中双击；否则打开该文件所在目录，请用户双击。若文件仍在压缩包中，或资源管理器看不到 Agent 所在的仓库，先将整个项目克隆或解压到用户可见目录，再从该目录启动。该文件检查用户侧的 Python 并创建桌面 `Codex CDP.lnk`，用户无需打开 PowerShell 或输入路径。启动脚本、状态文件和日志位于 `%LOCALAPPDATA%\Codex Token Sidebar\CDP`。若桌面已有同名快捷方式且不属于本工具，先检查并重命名旧快捷方式，再重新双击安装入口。
+   - **1 桌面启动器：** Agent 定位项目根目录的 `Install Codex CDP.cmd`，提供完整路径，可打开资源管理器并选中该文件。请用户亲自在资源管理器中双击，随后停在此步，等待用户反馈安装窗口的成功或错误信息。**Agent 不代为执行 CMD，也不改为运行其中的 Python 命令。** 外部双击是执行环境要求：Agent 内部与普通桌面进程可能看到不同的 AppData 文件；命令相同不能证明环境相同。若用户看不到仓库，先把完整项目放到用户可见目录再请其双击。
+
+     安装成功后桌面只有 `Codex CDP.lnk`，支持文件位于 `%LOCALAPPDATA%\Codex Token Sidebar\CDP`。此步只创建和预检入口。请用户从托盘完全退出 Codex，再双击桌面的 `Codex CDP`，恢复后按下述条件验收。已有入口且本次无需重装时，直接验收该入口。
    - **2 外部 PowerShell 命令：** Agent 提供当前仓库的绝对路径，请用户在资源管理器打开的外部 PowerShell 中运行以下命令；这一路线会在 `%LOCALAPPDATA%\Codex Token Sidebar\CDP` 创建 `codex-cdp.cmd` 并将该目录加入当前用户的 Path。以后在新的外部 PowerShell 中运行 `codex-cdp`；新终端未识别命令时重新登录 Windows。
 
      ```powershell
@@ -73,7 +75,7 @@ py -3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 
    - **用户自行描述：** 按其启动习惯设置等效方式；必须以 `--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1` 启动 Desktop，并完成下述验收。无法实现时说明原因，请用户改选 1 或 2。
 
-   两个入口都会在每次启动时重新定位当前 `OpenAI.Codex` 包内的主程序；若普通实例正在运行，命令窗口会要求用户先从托盘完全退出。脚本用主进程的 CDP 参数和 `/json/list` 主页面共同验收。若 Desktop 设为开机自动启动，应改用所选入口。重开后 Agent 再复查 `/json/list`，确认从所选入口启动，才继续下一步。
+   两个入口都会在每次启动时重新定位当前 `OpenAI.Codex` 包内的主程序；若普通实例正在运行，先请用户从托盘完全退出，桌面启动器会显示错误对话框而不会闪退。脚本用主进程的 CDP 参数和 `/json/list` 主页面共同验收。若 Desktop 设为开机自动启动，应改用所选入口。重开后 Agent 再复查 `/json/list` 和主进程 CDP 参数，确认从所选入口启动，才继续下一步。
 
 3. **触发并验收 Hook。** 先运行 `py -3 plugins/codex-token-sidebar/runtime/windows_lifecycle.py stop --json`，避免旧实例掩盖启动失败。请用户新建 Codex 任务；若出现 `codex-token-sidebar@stephen` 的 Hook 审查提示，由用户确认信任后再新建任务。选中已有用量的任务，检查侧栏和状态：
 

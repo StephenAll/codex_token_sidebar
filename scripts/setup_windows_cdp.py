@@ -23,6 +23,7 @@ import xml.etree.ElementTree as ET
 PACKAGE_NAME = "OpenAI.Codex"
 CDP_FLAGS = ("--remote-debugging-port=9222", "--remote-debugging-address=127.0.0.1")
 LAUNCHER_NAME = "codex_cdp.py"
+DESKTOP_LAUNCHER_NAME = "codex_cdp_desktop.pyw"
 COMMAND_NAME = "codex-cdp.cmd"
 DESKTOP_SHORTCUT_NAME = "Codex CDP.lnk"
 TERMINAL_COMMAND = ("@echo off\r\n"
@@ -260,17 +261,21 @@ def _write_owned(path: Path, content: bytes, state: dict, key: str) -> None:
     state[key] = _digest(content)
 
 
+def pythonw_executable() -> Path:
+    executable = Path(sys.executable).with_name("pythonw.exe")
+    if not executable.is_file():
+        raise SetupError(f"找不到与当前 Python 对应的无控制台启动器：{executable}")
+    return executable
+
+
 def _create_shortcut(path: Path, launcher: Path, desktop_exe: Path) -> None:
-    python = shutil.which("py.exe") or shutil.which("py")
-    if not python:
-        raise SetupError("找不到 py 启动器；请先确认外部 PowerShell 可运行 py -3")
-    environment = dict(os.environ, CODEX_CDP_LINK=str(path), CODEX_CDP_PY=python,
+    environment = dict(os.environ, CODEX_CDP_LINK=str(path), CODEX_CDP_PY=str(pythonw_executable()),
                        CODEX_CDP_SCRIPT=str(launcher), CODEX_CDP_ICON=f"{desktop_exe},0")
     command = (
         "$shell = New-Object -ComObject WScript.Shell; "
         "$shortcut = $shell.CreateShortcut($env:CODEX_CDP_LINK); "
         "$shortcut.TargetPath = $env:CODEX_CDP_PY; "
-        "$shortcut.Arguments = '-3 \"' + $env:CODEX_CDP_SCRIPT + '\" run --pause-on-error'; "
+        "$shortcut.Arguments = '-X utf8 \"' + $env:CODEX_CDP_SCRIPT + '\"'; "
         "$shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($env:CODEX_CDP_SCRIPT); "
         "$shortcut.IconLocation = $env:CODEX_CDP_ICON; "
         "$shortcut.Description = 'Start Codex Desktop with CDP'; "
@@ -365,9 +370,14 @@ def install(mode: str) -> Path:
     launcher = directory / LAUNCHER_NAME
 
     if mode == "app":
+        desktop_source = Path(__file__).with_name(DESKTOP_LAUNCHER_NAME)
+        if not desktop_source.is_file():
+            raise SetupError(f"缺少桌面启动脚本：{desktop_source}")
+        desktop_launcher = directory / DESKTOP_LAUNCHER_NAME
         output = desktop_directory() / DESKTOP_SHORTCUT_NAME
         _write_owned(launcher, source, state, "launcher_sha256")
-        _write_shortcut_owned(output, launcher, desktop_exe, state)
+        _write_owned(desktop_launcher, desktop_source.read_bytes(), state, "desktop_launcher_sha256")
+        _write_shortcut_owned(output, desktop_launcher, desktop_exe, state)
     else:
         _write_owned(launcher, source, state, "launcher_sha256")
         _write_owned(directory / COMMAND_NAME, TERMINAL_COMMAND, state, "command_sha256")
@@ -380,22 +390,165 @@ def install(mode: str) -> Path:
     return output
 
 
+def remove_user_path(entry: Path) -> None:
+    import winreg
+
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                             winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE)
+    except FileNotFoundError:
+        return
+    with key:
+        try:
+            current, kind = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            return
+        if not isinstance(current, str):
+            raise SetupError("用户 Path 注册表值不是字符串")
+        normalized = ntpath.normcase(ntpath.normpath(str(entry)))
+        remaining = [part for part in current.split(";")
+                     if ntpath.normcase(ntpath.normpath(os.path.expandvars(part.strip('"'))))
+                     != normalized]
+        updated = ";".join(remaining)
+        if updated != current:
+            winreg.SetValueEx(key, "Path", 0, kind, updated)
+    _broadcast_environment()
+
+
+def uninstall() -> list[Path]:
+    """Remove recorded CDP entries from the same external environment as installation."""
+    directory = support_directory()
+    state_path = directory / "setup-state.json"
+    current_shortcut = desktop_directory() / DESKTOP_SHORTCUT_NAME
+    if directory.is_symlink() or state_path.is_symlink():
+        raise SetupError("CDP 安装目录或状态文件是链接，未执行清理")
+    if not state_path.exists():
+        if current_shortcut.exists() or current_shortcut.is_symlink() or directory.exists():
+            raise SetupError("缺少 CDP 安装记录，无法确认现有文件归属；未清理，请交给 Agent 核对")
+        return []
+    state = _load_state(state_path)
+    if not state.get("launcher_sha256"):
+        raise SetupError("CDP 安装记录缺少启动脚本指纹，未执行清理")
+    candidates = {current_shortcut: state.get("desktop_shortcut_sha256")}
+    recorded = state.get("desktop_shortcut_path")
+    if recorded is not None:
+        if not isinstance(recorded, str):
+            raise SetupError("记录的桌面快捷方式路径无效")
+        shortcut = Path(recorded)
+        if not shortcut.is_absolute() or shortcut.name != DESKTOP_SHORTCUT_NAME:
+            raise SetupError("记录的桌面快捷方式路径无效")
+        candidates[shortcut] = state.get("desktop_shortcut_sha256")
+    for name, key in ((LAUNCHER_NAME, "launcher_sha256"),
+                      (DESKTOP_LAUNCHER_NAME, "desktop_launcher_sha256"),
+                      (COMMAND_NAME, "command_sha256")):
+        candidates[directory / name] = state.get(key)
+
+    # Validate every owned file before deleting anything, retaining evidence on failure.
+    owned = []
+    for path, digest in candidates.items():
+        if path.is_symlink():
+            raise SetupError(f"文件是链接，未清理：{path}")
+        if path.exists():
+            if not path.is_file() or not digest or _digest(path.read_bytes()) != digest:
+                raise SetupError(f"文件与安装记录不符，未清理：{path}")
+            owned.append(path)
+    terminal_path = state.get("terminal_path")
+    if terminal_path is not None and terminal_path != str(directory):
+        raise SetupError("记录的终端 Path 与安装目录不符，未清理")
+    logs = [directory / name for name in ("launch.log", "desktop-launch.log")]
+    for path in logs:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SetupError(f"日志路径异常，未清理：{path}")
+    cache = directory / "__pycache__"
+    if cache.is_symlink() or (cache.exists() and not cache.is_dir()):
+        raise SetupError(f"缓存路径异常，未清理：{cache}")
+    bytecode = list(cache.glob("codex_cdp.cpython-*.pyc")) if cache.exists() else []
+    for path in bytecode:
+        if path.is_symlink() or not path.is_file():
+            raise SetupError(f"缓存文件异常，未清理：{path}")
+    if terminal_path:
+        remove_user_path(directory)
+    for path in owned:
+        path.unlink()
+    for path in logs:
+        path.unlink(missing_ok=True)
+    for path in bytecode:
+        path.unlink()
+    if cache.exists() and not any(cache.iterdir()):
+        cache.rmdir()
+    state_path.unlink()
+    remaining = list(directory.iterdir())
+    if not remaining:
+        directory.rmdir()
+    return remaining
+
+
+def verify_desktop_entry(shortcut: Path) -> None:
+    """Check the installed files from the process that will expose them to Desktop."""
+    support = support_directory()
+    runner = support / DESKTOP_LAUNCHER_NAME
+    if not runner.is_file() or not (support / LAUNCHER_NAME).is_file():
+        raise SetupError("桌面进程可见的 CDP 启动文件不完整")
+    diagnosis = subprocess.run([sys.executable, "-X", "utf8", str(runner), "--diagnose"],
+                               capture_output=True, text=True, timeout=20,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if diagnosis.returncode != 0:
+        raise SetupError(f"桌面进程无法运行 CDP 启动文件：{diagnosis.stderr.strip()[-500:]}")
+    try:
+        report = json.loads(diagnosis.stdout)
+        if not isinstance(report, dict) or not report.get("executable"):
+            raise ValueError("invalid diagnosis")
+    except ValueError as error:
+        raise SetupError("CDP 启动文件的预检结果无效") from error
+
+    environment = dict(os.environ, CODEX_CDP_LINK=str(shortcut))
+    command = (
+        "$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CODEX_CDP_LINK); "
+        "$json = @{target=$shortcut.TargetPath; args=$shortcut.Arguments; "
+        "work=$shortcut.WorkingDirectory} | ConvertTo-Json -Compress; "
+        "[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($json))"
+    )
+    result = _run_powershell(command, environment=environment)
+    if result.returncode != 0:
+        raise SetupError("无法读取桌面 CDP 快捷方式")
+    try:
+        link = json.loads(_decode_payload(result.stdout))
+        if (not isinstance(link, dict)
+                or not all(isinstance(link.get(key), str) for key in ("target", "args", "work"))):
+            raise ValueError("invalid shortcut")
+    except ValueError as error:
+        raise SetupError("桌面 CDP 快捷方式信息无效") from error
+    expected_args = f'-X utf8 "{runner}"'
+    if (ntpath.normcase(link.get("target", "")) != ntpath.normcase(str(pythonw_executable()))
+            or link.get("args") != expected_args
+            or ntpath.normcase(link.get("work", "")) != ntpath.normcase(str(support))):
+        raise SetupError("桌面 CDP 快捷方式的目标、参数或起始目录不正确")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("app", "terminal", "run"))
+    parser.add_argument("mode", choices=("app", "terminal", "run", "uninstall"))
     parser.add_argument("--pause-on-error", action="store_true")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("此设置仅适用于 Windows 原生环境")
     try:
-        if args.mode == "run":
+        if args.mode == "uninstall":
+            remaining = uninstall()
+            message = "CDP 启动入口已清理。"
+            if remaining:
+                message += " 保留未登记内容：" + ", ".join(map(str, remaining))
+        elif args.mode == "run":
             launch_desktop()
-            print("Desktop CDP 已连接")
+            message = "Desktop CDP 已连接"
         else:
             target = install(args.mode)
-            print(f"启动入口已配置：{target}。下次完全退出 Desktop 后，从此入口启动。")
+            if args.mode == "app":
+                verify_desktop_entry(target)
+            message = f"启动入口已配置：{target}。下次完全退出 Desktop 后，从此入口启动。"
     except (OSError, ValueError, SetupError, subprocess.TimeoutExpired) as error:
-        message = f"设置或启动 Desktop CDP 失败：{error}"
+        action = "CDP 入口清理失败" if args.mode == "uninstall" else "设置或启动 Desktop CDP 失败"
+        message = f"{action}：{error}"
         _log_launch(f"failed {type(error).__name__}: {str(error)[:512]}")
         print(message, file=sys.stderr)
         if args.pause_on_error:
@@ -404,6 +557,7 @@ def main() -> int:
             except EOFError:
                 pass
         return 1
+    print(message)
     return 0
 
 

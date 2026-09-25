@@ -65,13 +65,14 @@ Windows 原生 PowerShell：
 ```powershell
 py -3 plugins/codex-token-sidebar/runtime/windows_lifecycle.py stop --json
 & $codexExe plugin remove codex-token-sidebar@stephen --json
+py -3 scripts/setup_windows_cdp.py uninstall
 ```
 
-用 Desktop CLI 的 `plugin list --json` 确认该插件已不在已安装列表；不要顺带移除可能仍供其他插件使用的市场。
+Windows 的三条命令由 Agent 从项目根目录依次执行；上一条失败时先处理错误，再继续。用 Desktop CLI 的 `plugin list --json` 确认该插件已不在已安装列表。若 `stephen` 市场映射指向当前项目，而且该市场只包含此插件，再移除该映射；市场仍供其他插件使用时保留。
 
 若安装时为本插件配置了固定 CDP 启动入口，再清理该入口：
 
 - **macOS：** `~/Applications/Codex CDP.app` 仅在 `Contents/Resources/codex-token-sidebar-launcher.txt` 标记存在且确认是本项目生成的启动器时删除。终端路线仅从相应 shell 配置文件中删除 `# >>> Codex Token Sidebar CDP >>>` 到 `# <<< Codex Token Sidebar CDP <<<` 的完整区块；保留其他配置和原始 Desktop 应用。
-- **Windows：** Agent 定位项目根目录的 `Uninstall Codex CDP.cmd`，请用户亲自在资源管理器中双击，停在此步等待结果。与安装一样，清理必须发生在外部桌面环境；Agent 不在内部终端代跑 CMD 或底层 Python 命令。脚本核对安装记录后删除本工具的桌面快捷方式、支持脚本、日志和状态文件；终端路线还会移除其用户 Path 项，其他文件保留。若记录缺失或文件不匹配，窗口明确报错并保留文件，由 Agent 核对归属后处理。
+- **Windows：** 上述 `uninstall` 命令根据 `%LOCALAPPDATA%\Codex Token Sidebar\CDP\setup-state.json` 记录的路径和 SHA-256，清理桌面 `Codex CDP.lnk`、`codex_cdp.py`、`codex_cdp_desktop.pyw`、`codex-cdp.cmd` 和状态文件；终端路线精确移除用户 Path 中记录的 CDP 目录。它还清理 `launch.log`、`desktop-launch.log`、生成的启动器字节码，以及停止侧栏后留在 `%LOCALAPPDATA%\Codex Token Sidebar` 下的 `control.json`、`instance.lock`、`launch.lock`、`sidebar.log`、`credits-rates.json`。其他内容保留并在结果中列出。若安装记录缺失但当前视图仍有 CDP 入口，或文件与记录不匹配，停止入口清理并报告，不按同名猜测归属。
 
-Windows 卸载完成条件：插件列表已无该插件，用户确认外部卸载窗口显示 `CDP launcher removal completed`，并确认桌面 `Codex CDP` 快捷方式已消失。未取得外部结果时只报告“插件已移除，CDP 入口清理待完成”。移除快捷方式不会改变当前 Codex 进程的启动参数；需要结束当前 CDP 监听时，请用户完全退出 Codex 后从原始应用入口启动。
+Windows 卸载完成条件：插件列表已无该插件，`uninstall` 命令成功，桌面快捷方式和 `%LOCALAPPDATA%\Codex Token Sidebar` 下已登记的资产均已消失。命令只报告当前 Agent 环境的清理结果；Agent 还须用可用的桌面视图复核快捷方式和支持目录。若 Agent 与桌面进程看到的 AppData 不一致、无法核实，报告具体残留，不宣称卸载完成。用户曾设置 `CODEX_TOKEN_SIDEBAR_STATE_DIR` 时，还需单独核对该自定义目录。项目源码目录由用户决定是否保留。移除快捷方式不会改变当前 Codex 进程的启动参数；需要结束当前 CDP 监听时，请用户完全退出 Codex 后从原始应用入口启动。

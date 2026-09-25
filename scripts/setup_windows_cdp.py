@@ -418,16 +418,16 @@ def remove_user_path(entry: Path) -> None:
 def uninstall() -> list[Path]:
     """Remove recorded CDP entries from the same external environment as installation."""
     directory = support_directory()
+    runtime_directory = directory.parent
     state_path = directory / "setup-state.json"
     current_shortcut = desktop_directory() / DESKTOP_SHORTCUT_NAME
-    if directory.is_symlink() or state_path.is_symlink():
-        raise SetupError("CDP 安装目录或状态文件是链接，未执行清理")
+    if runtime_directory.is_symlink() or directory.is_symlink() or state_path.is_symlink():
+        raise SetupError("插件运行目录或安装状态文件是链接，未执行清理")
     if not state_path.exists():
         if current_shortcut.exists() or current_shortcut.is_symlink() or directory.exists():
             raise SetupError("缺少 CDP 安装记录，无法确认现有文件归属；未清理，请交给 Agent 核对")
-        return []
-    state = _load_state(state_path)
-    if not state.get("launcher_sha256"):
+    state = _load_state(state_path) if state_path.exists() else {}
+    if state_path.exists() and not state.get("launcher_sha256"):
         raise SetupError("CDP 安装记录缺少启动脚本指纹，未执行清理")
     candidates = {current_shortcut: state.get("desktop_shortcut_sha256")}
     recorded = state.get("desktop_shortcut_path")
@@ -466,6 +466,12 @@ def uninstall() -> list[Path]:
     for path in bytecode:
         if path.is_symlink() or not path.is_file():
             raise SetupError(f"缓存文件异常，未清理：{path}")
+    runtime_files = [runtime_directory / name for name in
+                     ("control.json", "instance.lock", "launch.lock", "sidebar.log",
+                      "credits-rates.json")]
+    for path in runtime_files:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise SetupError(f"运行状态路径异常，未清理：{path}")
     if terminal_path:
         remove_user_path(directory)
     for path in owned:
@@ -476,10 +482,16 @@ def uninstall() -> list[Path]:
         path.unlink()
     if cache.exists() and not any(cache.iterdir()):
         cache.rmdir()
-    state_path.unlink()
-    remaining = list(directory.iterdir())
-    if not remaining:
+    state_path.unlink(missing_ok=True)
+    remaining = list(directory.iterdir()) if directory.exists() else []
+    if directory.exists() and not remaining:
         directory.rmdir()
+    for path in runtime_files:
+        path.unlink(missing_ok=True)
+    if runtime_directory.exists():
+        remaining.extend(path for path in runtime_directory.iterdir() if path != directory)
+    if runtime_directory.exists() and not remaining:
+        runtime_directory.rmdir()
     return remaining
 
 
@@ -534,8 +546,11 @@ def main() -> int:
         parser.error("此设置仅适用于 Windows 原生环境")
     try:
         if args.mode == "uninstall":
+            had_install_record = (support_directory() / "setup-state.json").is_file()
             remaining = uninstall()
-            message = "CDP 启动入口已清理。"
+            message = ("已清理当前 Agent 可见的 CDP 安装文件；请核对桌面快捷方式。"
+                       if had_install_record else
+                       "当前 Agent 环境没有 CDP 安装记录；无法据此确认桌面入口已移除。")
             if remaining:
                 message += " 保留未登记内容：" + ", ".join(map(str, remaining))
         elif args.mode == "run":

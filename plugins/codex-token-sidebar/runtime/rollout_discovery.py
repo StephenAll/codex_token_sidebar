@@ -16,6 +16,7 @@ from state_index import IndexSnapshot, IndexUnavailable, NativeStateIndex
 _UUID = r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 UUID_RE = re.compile(_UUID, re.IGNORECASE)
 ROLLOUT_ID_RE = re.compile(r"-" + _UUID + r"\.jsonl$", re.IGNORECASE)
+WINDOWS_FILE_SIGNATURE = os.name == "nt"
 
 
 def _session_id_from_path(path: Path) -> str:
@@ -42,7 +43,9 @@ class _Metadata:
 
 
 def _signature(info: os.stat_result) -> tuple[int, ...]:
-    return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size
+    # Windows path and descriptor stats can disagree on ctime for one unchanged file.
+    stable = info.st_dev, info.st_ino, info.st_mtime_ns
+    return (*stable, info.st_size) if WINDOWS_FILE_SIGNATURE else (*stable, info.st_ctime_ns, info.st_size)
 
 
 def _scan(root: Path) -> set[Path]:

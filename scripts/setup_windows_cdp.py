@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install or run a repeatable CDP entry point for ChatGPT Desktop on Windows."""
+"""Install a desktop-visible CDP entry point, or launch Desktop through it."""
 
 from __future__ import annotations
 
@@ -24,16 +24,19 @@ PACKAGE_NAME = "OpenAI.Codex"
 CDP_FLAGS = ("--remote-debugging-port=9222", "--remote-debugging-address=127.0.0.1")
 LAUNCHER_NAME = "codex_cdp.py"
 COMMAND_NAME = "codex-cdp.cmd"
-SHORTCUT_NAME = "Codex CDP.lnk"
-COMMAND = ("@echo off\r\n"
-           "rem Codex Token Sidebar CDP command\r\n"
-           f'py -3 "%~dp0{LAUNCHER_NAME}" run %*\r\n'
-           "exit /b %ERRORLEVEL%\r\n").encode("utf-8")
+DESKTOP_SHORTCUT_NAME = "Codex CDP.lnk"
+TERMINAL_COMMAND = ("@echo off\r\n"
+                    f'py -3 "%~dp0{LAUNCHER_NAME}" run %*\r\n'
+                    "exit /b %ERRORLEVEL%\r\n").encode("ascii")
 PACKAGE_QUERY = (
     f"$p = Get-AppxPackage -Name '{PACKAGE_NAME}' | Sort-Object Version -Descending | "
     "Select-Object -First 1; "
     "if (-not $p) { exit 2 }; "
     "[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($p.InstallLocation))"
+)
+DESKTOP_QUERY = (
+    "$p = [Environment]::GetFolderPath('DesktopDirectory'); "
+    "[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($p))"
 )
 
 
@@ -56,16 +59,20 @@ def _run_powershell(command: str, *, environment: dict[str, str] | None = None) 
                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
-def decode_package_directory(output: str) -> Path:
+def _decode_payload(output: str) -> str:
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     if not lines:
-        raise SetupError(f"未找到 {PACKAGE_NAME} 的安装目录")
+        raise SetupError("PowerShell 没有返回路径或进程信息")
     try:
-        value = base64.b64decode(lines[-1], validate=True).decode("utf-16-le")
+        return base64.b64decode(lines[-1], validate=True).decode("utf-16-le")
     except (ValueError, UnicodeError) as error:
-        raise SetupError("无法读取 Desktop 安装目录") from error
+        raise SetupError("无法解码 PowerShell 的结果") from error
+
+
+def decode_package_directory(output: str) -> Path:
+    value = _decode_payload(output)
     if not value or not PureWindowsPath(value).is_absolute():
-        raise SetupError("Desktop 安装目录不是绝对路径")
+        raise SetupError("Desktop 目录不是绝对路径")
     return Path(value)
 
 
@@ -77,6 +84,23 @@ def package_directory() -> Path:
     if not directory.is_dir():
         raise SetupError(f"Desktop 安装目录不可访问：{directory}")
     return directory
+
+
+def desktop_directory() -> Path:
+    result = _run_powershell(DESKTOP_QUERY)
+    if result.returncode != 0:
+        raise SetupError("无法定位当前用户的桌面目录")
+    directory = decode_package_directory(result.stdout)
+    if not directory.is_dir():
+        raise SetupError(f"桌面目录不可访问：{directory}")
+    return directory
+
+
+def support_directory() -> Path:
+    local_data = os.environ.get("LOCALAPPDATA")
+    if not local_data or not Path(local_data).is_absolute():
+        raise SetupError("无法定位当前用户的 LocalAppData 目录")
+    return Path(local_data) / "Codex Token Sidebar" / "CDP"
 
 
 def desktop_executable(package: Path) -> Path:
@@ -131,27 +155,71 @@ def has_desktop_page() -> bool:
         connection.close()
 
 
-def launch_desktop() -> None:
-    executable = desktop_executable(package_directory())
+def main_processes(executable: Path) -> list[dict]:
     environment = dict(os.environ, CODEX_CDP_EXE=str(executable))
-    command = ("Start-Process -FilePath $env:CODEX_CDP_EXE "
-               f"-ArgumentList @('{CDP_FLAGS[0]}','{CDP_FLAGS[1]}') "
-               "-ErrorAction Stop")
+    command = (
+        "$name = [IO.Path]::GetFileName($env:CODEX_CDP_EXE); "
+        "$rows = @(Get-CimInstance Win32_Process -Filter (\"Name='\" + $name + \"'\") -ErrorAction Stop | "
+        "Where-Object { $_.ExecutablePath -and $_.ExecutablePath -ieq $env:CODEX_CDP_EXE "
+        "-and $_.CommandLine -notmatch ' --type=' } | Select-Object ProcessId, CommandLine); "
+        "$json = ConvertTo-Json -InputObject $rows -Compress; "
+        "[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($json))"
+    )
     result = _run_powershell(command, environment=environment)
     if result.returncode != 0:
-        raise SetupError(f"无法启动 Desktop：{result.stderr.strip() or result.stdout.strip()}")
+        raise SetupError("无法检查 Desktop 主进程")
+    try:
+        value = json.loads(_decode_payload(result.stdout))
+    except ValueError as error:
+        raise SetupError("Desktop 主进程信息无效") from error
+    if value is None:
+        return []
+    rows = value if isinstance(value, list) else [value]
+    if not all(isinstance(row, dict) for row in rows):
+        raise SetupError("Desktop 主进程信息无效")
+    return rows
+
+
+def _has_cdp_flags(process: dict) -> bool:
+    command = process.get("CommandLine")
+    return isinstance(command, str) and all(flag in command for flag in CDP_FLAGS)
+
+
+def _log_launch(event: str) -> None:
+    # The external installer copies the runner into its durable support directory.
+    if Path(__file__).name != LAUNCHER_NAME:
+        return
+    log = Path(__file__).resolve().parent / "launch.log"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {event}\n")
+    except OSError:
+        pass
+
+
+def launch_desktop() -> None:
+    executable = desktop_executable(package_directory())
+    running = main_processes(executable)
+    if running:
+        if has_desktop_page() and any(_has_cdp_flags(process) for process in running):
+            return
+        try:
+            input("请从托盘完全退出 Desktop，然后按 Enter 继续：")
+        except EOFError as error:
+            raise SetupError("请在外部命令窗口运行桌面启动器") from error
+        if main_processes(executable):
+            raise SetupError("Desktop 仍在运行；请从托盘完全退出后重试")
+    _log_launch("starting")
+    subprocess.Popen([str(executable), *CDP_FLAGS], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(40):
-        if has_desktop_page():
+        if has_desktop_page() and any(_has_cdp_flags(process)
+                                      for process in main_processes(executable)):
+            _log_launch("connected")
             return
         time.sleep(0.5)
-    raise SetupError("CDP 尚未连接。若 Desktop 已在普通模式运行，请从托盘完全退出后重新启动 Codex CDP。")
-
-
-def state_directory() -> Path:
-    local = os.environ.get("LOCALAPPDATA")
-    if not local:
-        raise SetupError("找不到 LOCALAPPDATA")
-    return Path(local) / "Codex Token Sidebar" / "CDP"
+    raise SetupError("CDP 主页面或 Desktop 主进程参数未通过验证；请检查 launch.log")
 
 
 def _digest(content: bytes) -> str:
@@ -192,6 +260,46 @@ def _write_owned(path: Path, content: bytes, state: dict, key: str) -> None:
     state[key] = _digest(content)
 
 
+def _create_shortcut(path: Path, launcher: Path) -> None:
+    python = shutil.which("py.exe") or shutil.which("py")
+    if not python:
+        raise SetupError("找不到 py 启动器；请先确认外部 PowerShell 可运行 py -3")
+    environment = dict(os.environ, CODEX_CDP_LINK=str(path), CODEX_CDP_PY=python,
+                       CODEX_CDP_SCRIPT=str(launcher))
+    command = (
+        "$shell = New-Object -ComObject WScript.Shell; "
+        "$shortcut = $shell.CreateShortcut($env:CODEX_CDP_LINK); "
+        "$shortcut.TargetPath = $env:CODEX_CDP_PY; "
+        "$shortcut.Arguments = '-3 \"' + $env:CODEX_CDP_SCRIPT + '\" run --pause-on-error'; "
+        "$shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($env:CODEX_CDP_SCRIPT); "
+        "$shortcut.Description = 'Start Codex Desktop with CDP'; "
+        "$shortcut.Save()"
+    )
+    result = _run_powershell(command, environment=environment)
+    if result.returncode != 0 or not path.is_file():
+        raise SetupError("无法在桌面创建 CDP 快捷方式")
+
+
+def _write_shortcut_owned(path: Path, launcher: Path, state: dict) -> None:
+    if path.is_symlink():
+        raise SetupError(f"拒绝覆盖链接：{path}")
+    if path.exists() and (state.get("desktop_shortcut_path") != str(path)
+                          or state.get("desktop_shortcut_sha256") != _digest(path.read_bytes())):
+        raise SetupError(f"已有非本工具管理的快捷方式，未覆盖：{path}")
+    with tempfile.NamedTemporaryFile(prefix=".codex-cdp-", suffix=".lnk",
+                                     dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+    temporary.unlink()
+    try:
+        _create_shortcut(temporary, launcher)
+        digest = _digest(temporary.read_bytes())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    state["desktop_shortcut_path"] = str(path)
+    state["desktop_shortcut_sha256"] = digest
+
+
 def _save_state(path: Path, state: dict) -> None:
     content = (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     if path.is_symlink():
@@ -204,41 +312,6 @@ def _save_state(path: Path, state: dict) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def windowless_python() -> tuple[Path, str]:
-    launcher = shutil.which("pyw.exe")
-    if launcher:
-        return Path(launcher), "-3 "
-    executable = Path(sys.executable).with_name("pythonw.exe")
-    if executable.is_file():
-        return executable, ""
-    raise SetupError("找不到 pyw.exe 或 pythonw.exe；请改用终端命令")
-
-
-def _create_shortcut(link: Path, python: Path, prefix: str, launcher: Path) -> None:
-    link.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".codex-cdp-shortcut-", dir=link.parent) as directory:
-        staged = Path(directory) / SHORTCUT_NAME
-        environment = dict(os.environ)
-        environment.update({
-            "CODEX_CDP_LINK": str(staged),
-            "CODEX_CDP_PYTHON": str(python),
-            "CODEX_CDP_ARGUMENTS": f'{prefix}"{launcher}" run --gui',
-            "CODEX_CDP_HOME": str(launcher.parent),
-        })
-        command = (
-            "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CODEX_CDP_LINK); "
-            "$s.TargetPath = $env:CODEX_CDP_PYTHON; "
-            "$s.Arguments = $env:CODEX_CDP_ARGUMENTS; "
-            "$s.WorkingDirectory = $env:CODEX_CDP_HOME; "
-            "$s.Description = 'Start ChatGPT with CDP for Codex Token Sidebar'; "
-            "$s.Save()"
-        )
-        result = _run_powershell(command, environment=environment)
-        if result.returncode != 0 or not staged.is_file():
-            raise SetupError(f"无法创建开始菜单快捷方式：{result.stderr.strip() or result.stdout.strip()}")
-        staged.replace(link)
 
 
 def path_with_entry(existing: str, entry: Path) -> str:
@@ -283,7 +356,7 @@ def add_user_path(entry: Path) -> bool:
 
 def install(mode: str) -> Path:
     desktop_executable(package_directory())
-    directory = state_directory()
+    directory = support_directory()
     directory.mkdir(parents=True, exist_ok=True)
     state_path = directory / "setup-state.json"
     state = _load_state(state_path)
@@ -291,23 +364,12 @@ def install(mode: str) -> Path:
     launcher = directory / LAUNCHER_NAME
 
     if mode == "app":
-        appdata = os.environ.get("APPDATA")
-        if not appdata:
-            raise SetupError("找不到 APPDATA")
-        link = Path(appdata) / "Microsoft/Windows/Start Menu/Programs" / SHORTCUT_NAME
-        if link.exists():
-            if (state.get("shortcut_path") != str(link)
-                    or state.get("shortcut_sha256") != _digest(link.read_bytes())):
-                raise SetupError(f"开始菜单已有非本工具管理的快捷方式，未覆盖：{link}")
-        python, prefix = windowless_python()
+        output = desktop_directory() / DESKTOP_SHORTCUT_NAME
         _write_owned(launcher, source, state, "launcher_sha256")
-        _create_shortcut(link, python, prefix, launcher)
-        state["shortcut_path"] = str(link)
-        state["shortcut_sha256"] = _digest(link.read_bytes())
-        output = link
+        _write_shortcut_owned(output, launcher, state)
     else:
         _write_owned(launcher, source, state, "launcher_sha256")
-        _write_owned(directory / COMMAND_NAME, COMMAND, state, "command_sha256")
+        _write_owned(directory / COMMAND_NAME, TERMINAL_COMMAND, state, "command_sha256")
         path_updated = add_user_path(directory)
         state["terminal_path"] = str(directory)
         if not path_updated:
@@ -320,27 +382,26 @@ def install(mode: str) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("app", "terminal", "run"))
-    parser.add_argument("--gui", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--pause-on-error", action="store_true")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("此设置仅适用于 Windows 原生环境")
-    if args.gui and args.mode != "run":
-        parser.error("--gui 仅适用于 run")
     try:
         if args.mode == "run":
             launch_desktop()
-            if not args.gui:
-                print("Desktop CDP 已连接")
+            print("Desktop CDP 已连接")
         else:
             target = install(args.mode)
             print(f"启动入口已配置：{target}。下次完全退出 Desktop 后，从此入口启动。")
     except (OSError, ValueError, SetupError, subprocess.TimeoutExpired) as error:
         message = f"设置或启动 Desktop CDP 失败：{error}"
-        if args.gui:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(None, message, "Codex CDP", 0x10)
-        else:
-            print(message, file=sys.stderr)
+        _log_launch(f"failed {type(error).__name__}: {str(error)[:512]}")
+        print(message, file=sys.stderr)
+        if args.pause_on_error:
+            try:
+                input("按 Enter 关闭窗口…")
+            except EOFError:
+                pass
         return 1
     return 0
 

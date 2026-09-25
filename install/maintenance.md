@@ -28,7 +28,7 @@
 
 1. 读取 `plugin list --json`、市场映射和上述运行状态，记录当前版本、指纹、安装缓存路径及源码位置。准备目标版本的完整项目目录，确认其中的市场清单和插件清单均可读取。
 2. **在覆盖安装前准备回退来源。** 将当前已安装插件目录和对应版本的完整项目源码（含市场清单）备份到项目仓库之外。按安装路线第 3 步的身份检查方法，核对旧源码与已安装运行文件的版本、指纹；若实例正在运行，也要与运行状态一致。无法确认旧版来源或完成备份时，先停止更新并报告原因。
-3. 通过当前版本的控制命令停止运行实例，确认返回 `status=stopped`：macOS 运行 `plugins/codex-token-sidebar/scripts/stop_sidebar.sh --json`；Windows 运行 `py -3 plugins/codex-token-sidebar/runtime/windows_lifecycle.py stop --json`。macOS 从没有 `control.sock` 的早期版本迁移时，只依据已核对的完整安装路径识别旧进程；旧 PID 文件不能单独作为终止依据。
+3. 通过当前版本的控制命令停止运行实例，确认返回 `status=stopped`：macOS 运行 `plugins/codex-token-sidebar/scripts/stop_sidebar.sh --json`；Windows 运行 `py -3 plugins/codex-token-sidebar/runtime/windows_lifecycle.py stop --json`。
 4. 若 `stephen` 市场尚未指向目标版本的项目目录，用 Desktop CLI 执行 `plugin marketplace remove stephen`，再从目标项目根目录执行 `plugin marketplace add .`；若已指向目标目录则保持不动。然后用同一个 CLI 重新安装插件；本地市场重复执行 `plugin add` 会刷新安装缓存。记录返回的安装路径：
 
    ```sh
@@ -72,4 +72,4 @@ py -3 plugins/codex-token-sidebar/runtime/windows_lifecycle.py stop --json
 若安装时为本插件配置了固定 CDP 启动入口，再清理该入口：
 
 - **macOS：** `~/Applications/Codex CDP.app` 仅在 `Contents/Resources/codex-token-sidebar-launcher.txt` 标记存在且确认是本项目生成的启动器时删除。终端路线仅从相应 shell 配置文件中删除 `# >>> Codex Token Sidebar CDP >>>` 到 `# <<< Codex Token Sidebar CDP <<<` 的完整区块；保留其他配置和原始 Desktop 应用。
-- **Windows：** 先读取 `%LOCALAPPDATA%\Codex Token Sidebar\CDP\setup-state.json`。仅删除路径和 SHA-256 与记录一致的快捷方式、`codex-cdp.cmd` 和 `codex_cdp.py`；终端路线还要从当前用户的 Path 中移除记录的 `CDP` 目录。全部清理成功后删除状态文件；若文件已变化或无法核对，保留该文件并报告，不删除同目录中的其他内容。
+- **Windows：** 先读取 `%LOCALAPPDATA%\Codex Token Sidebar\CDP\setup-state.json`。仅删除路径及 SHA-256 与记录一致的桌面 `Codex CDP.lnk`、目录内的 `codex-cdp.cmd` 和 `codex_cdp.py`；终端路线还要从当前用户的 Path 中移除记录的 `CDP` 目录。确认 `launch.log` 是本工具生成的日志后清理，再删除状态文件；若文件已变化或无法核对，保留并报告，不删除其他内容。

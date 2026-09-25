@@ -16,7 +16,8 @@ from usage import (
 )
 from credits import CreditsLedger
 from rate_sync import bundled_card
-from rollout_discovery import DiscoveryResult, RolloutCatalog, _session_id_from_path
+import rollout_discovery
+from rollout_discovery import DiscoveryResult, RolloutCatalog, _session_id_from_path, _signature as _file_signature
 
 LOGGER = logging.getLogger("codex-token-sidebar")
 
@@ -32,7 +33,7 @@ class _RolloutState:
         self.head = b""
         self.tail = b""
         self.digest = hashlib.sha256()
-        self.needs_audit = False
+        self.needs_audit = rollout_discovery.WINDOWS_FILE_SIGNATURE
         self.audit_after = audit_after
 
     def consume(self, data: bytes) -> None:
@@ -90,8 +91,7 @@ class UsageReader:
 
     @staticmethod
     def _signature(path: Path) -> tuple[int, ...]:
-        stat = path.stat()
-        return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        return _file_signature(path.stat())
 
     def _session_paths(self, session_id: str) -> list[Path]:
         result = self._discoverer.resolve(session_id)
@@ -112,7 +112,7 @@ class UsageReader:
 
     @staticmethod
     def _stat_signature(stat: os.stat_result) -> tuple[int, ...]:
-        return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+        return _file_signature(stat)
 
     def _apply_changes(self, path: str, changes: tuple[dict, dict]) -> None:
         for sources, totals, delta in zip(self._contributors, self._totals, changes):
@@ -207,7 +207,7 @@ class UsageReader:
             state.consume(data)
             state.needs_audit = True
         if audit:
-            state.needs_audit = False
+            state.needs_audit = rollout_discovery.WINDOWS_FILE_SIGNATURE
             state.audit_after = now + self._audit_interval
         state.signature = expected
         self._apply_changes(key, state.parser.drain())

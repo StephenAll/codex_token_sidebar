@@ -16,6 +16,8 @@ Codex Token Sidebar 是面向 macOS 和 Windows 版 Codex Desktop 的 Token 用�
 - **费率自动更新：** 定期同步 OpenAI [官方定价](https://learn.chatgpt.com/docs/pricing)中的模型 Credits 费率；新模型在官方模型目录和费率表中公布后，也会自动纳入估算，日常价格更新无需手动维护。
 - **回到关键轮次：** 发生模型改路由时，面板列出最近三次记录；点击对应卡片，即可回到这次变化发生的轮次。
 
+> **Beta 提示：** 模型改路由功能仍在测试阶段。我目前缺少能触发真实改路由的账号，因此路由识别和轮次定位可能有遗漏或偏差。如果你发现与实际情况不符，欢迎在 [Issues](https://github.com/StephenAll/codex_token_sidebar/issues) 反馈。
+
 一次长任务里，自动审查或子代理接手工作后，先看功能分布，就能知道新增用量落在哪个环节；再看模型明细，便能比较不同模型的占比和参考 Credits。需要复盘改路由时，卡片又能把你带回发生变化的那次回复。切换任务，面板也会随之更新，让这些判断始终围绕眼前的工作。
 
 ![Codex Token Sidebar 功能知识图谱：统计范围、Token 用量、参考 Credits、统计视角、模型改路由与本地隐私](assets/project-knowledge-graph.png)

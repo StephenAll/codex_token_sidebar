@@ -1,12 +1,12 @@
 # Windows 原生安装路线（供 Codex Agent 执行）
 
-仅在 Codex Desktop 宿主系统为 Windows、Agent environment 为 Windows native 时执行。命令从仓库根目录在 PowerShell 中运行；先确认 Python 3.10+：
+仅在 Codex Desktop 宿主系统为 Windows、Agent environment 为 Windows native 时执行。除第 2 步的桌面操作外，命令由 Agent 从仓库根目录在 PowerShell 中运行；先确认 Python 3.10+：
 
 ```powershell
 py -3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 ```
 
-若失败，先让用户在正常 Windows 环境中安装 Python 3.10+，重启 Desktop，并确认 Agent 和外部 PowerShell 都能执行 `py -3`；Hook 也依赖这个命令。
+若失败，先让用户在正常 Windows 环境中安装 Python 3.10+，重启 Desktop，再由 Agent 重试；Hook 也依赖这个命令。桌面启动器的双击安装入口会自行检查用户侧的 Python。
 
 1. **安装插件。** 依次检查显式配置的 `CODEX_CLI_PATH`、Desktop 包内 CLI 和正在运行的 app-server CLI，选用当前 Agent 可执行的文件。整块命令在同一次 PowerShell 调用中运行，不写死缓存路径。
 
@@ -39,11 +39,14 @@ py -3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
      & $codexExe plugin marketplace add .
      if ($LASTEXITCODE -ne 0) { throw '注册本地市场失败' }
    }
-   & $codexExe plugin add codex-token-sidebar@stephen
+   $installJson = & $codexExe plugin add codex-token-sidebar@stephen --json
    if ($LASTEXITCODE -ne 0) { throw '安装插件失败' }
+   $installResult = ConvertFrom-Json -InputObject ($installJson -join [Environment]::NewLine)
+   if (-not $installResult.installedPath) { throw '安装结果缺少 installedPath' }
+   $installResult
    ```
 
-   记录安装命令返回的插件缓存路径。
+   记录安装结果中的 `installedPath`，供第 3 步核对。
 
 2. **设置 CDP 启动方式并连接 Desktop。** 查询 `http://127.0.0.1:9222/json/list`，必须有符合下列条件的 Desktop 主页面。若 9222 被其他应用占用，先处理端口冲突。无论当前是否已连接，都要确认用户以后从哪里启动带 CDP 的 Desktop；已配置好固定入口时无需重复创建。
 
@@ -58,17 +61,16 @@ py -3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 
    用户尚未说明启动偏好时，只问一次：「以后你想怎样启动带 CDP 的 Codex？回复 **1 桌面启动器（推荐）**、**2 外部 PowerShell 命令**，或直接描述你希望的其他方式。」确定选择后执行对应路线。
 
-   **1 或 2 都由用户在资源管理器打开的外部 PowerShell 中完成设置**，确保启动入口可供桌面进程使用。Agent 提供当前仓库的绝对路径，用户运行以下命令，并把 `app` 替换为所选路线的 `terminal`（选择 2 时）：
+   - **1 桌面启动器：** Agent 定位项目根目录的 `Install Codex CDP.cmd`，优先用已有的桌面操作能力在资源管理器中双击；否则打开该文件所在目录，请用户双击。若文件仍在压缩包中，或资源管理器看不到 Agent 所在的仓库，先将整个项目克隆或解压到用户可见目录，再从该目录启动。该文件检查用户侧的 Python 并创建桌面 `Codex CDP.lnk`，用户无需打开 PowerShell 或输入路径。启动脚本、状态文件和日志位于 `%LOCALAPPDATA%\Codex Token Sidebar\CDP`。若桌面已有同名快捷方式且不属于本工具，先检查并重命名旧快捷方式，再重新双击安装入口。
+   - **2 外部 PowerShell 命令：** Agent 提供当前仓库的绝对路径，请用户在资源管理器打开的外部 PowerShell 中运行以下命令；这一路线会在 `%LOCALAPPDATA%\Codex Token Sidebar\CDP` 创建 `codex-cdp.cmd` 并将该目录加入当前用户的 Path。以后在新的外部 PowerShell 中运行 `codex-cdp`；新终端未识别命令时重新登录 Windows。
 
-   ```powershell
-   $repo = '<Agent 提供的仓库根目录绝对路径>'
-   $setup = Join-Path $repo 'scripts\setup_windows_cdp.py'
-   if (-not (Test-Path -LiteralPath $setup)) { throw '外部 PowerShell 看不到仓库；先将仓库克隆到普通用户可见目录' }
-   py -3 $setup app
-   ```
+     ```powershell
+     $repo = '<Agent 提供的仓库根目录绝对路径>'
+     $setup = Join-Path $repo 'scripts\setup_windows_cdp.py'
+     if (-not (Test-Path -LiteralPath $setup)) { throw '外部 PowerShell 看不到仓库；先将仓库克隆到普通用户可见目录' }
+     py -3 $setup terminal
+     ```
 
-   - **1：** 外部设置命令只在桌面创建 `Codex CDP.lnk`。启动脚本、状态文件和日志留在 `%LOCALAPPDATA%\Codex Token Sidebar\CDP`；请用户以后双击快捷方式。若桌面已有同名快捷方式且不属于本工具，先检查并重命名旧快捷方式，再重新运行设置命令。
-   - **2：** 外部设置命令在同一 `%LOCALAPPDATA%\Codex Token Sidebar\CDP` 目录创建 `codex-cdp.cmd` 并将该目录加入当前用户的 Path；请用户以后在新的外部 PowerShell 中运行 `codex-cdp`。新终端未识别命令时重新登录 Windows。
    - **用户自行描述：** 按其启动习惯设置等效方式；必须以 `--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1` 启动 Desktop，并完成下述验收。无法实现时说明原因，请用户改选 1 或 2。
 
    两个入口都会在每次启动时重新定位当前 `OpenAI.Codex` 包内的主程序；若普通实例正在运行，命令窗口会要求用户先从托盘完全退出。脚本用主进程的 CDP 参数和 `/json/list` 主页面共同验收。若 Desktop 设为开机自动启动，应改用所选入口。重开后 Agent 再复查 `/json/list`，确认从所选入口启动，才继续下一步。
@@ -80,7 +82,7 @@ py -3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
    py -3 -c "import json,sys; from pathlib import Path; sys.path.insert(0,'plugins/codex-token-sidebar/runtime'); from identity import build_identity; print(json.dumps(build_identity(Path('plugins/codex-token-sidebar/runtime/codex_token_sidebar.py'))))"
    ```
 
-   验收条件：状态的 `version`、`fingerprint` 与源码身份一致，`installationPath` 等于第 1 步记录的安装缓存路径；`status=running`、`health.state=healthy`、`health.reader=ok`、`health.cdp=connected`、`health.mounted=true`、`health.lastSyncAt` 有值，并且侧栏显示 Token 面板。任务刚加载时可稍后复查。
+   验收条件：状态的 `version`、`fingerprint` 与源码身份一致，`installationPath` 等于第 1 步记录的 `installedPath`；`status=running`、`health.state=healthy`、`health.reader=ok`、`health.cdp=connected`、`health.mounted=true`、`health.lastSyncAt` 有值，并且侧栏显示 Token 面板。任务刚加载时可稍后复查。
 
    若未启动，先将第 1 步确认的 CLI 绝对路径重新赋给 `$codexExe`，再运行 `py -3 scripts/check_plugin_hooks.py --app-server $codexExe --marketplace-path .agents/plugins/marketplace.json --cwd .` 只读检查 Hook；它只验证发现与信任状态。
 

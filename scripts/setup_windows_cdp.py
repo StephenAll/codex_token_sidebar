@@ -260,18 +260,19 @@ def _write_owned(path: Path, content: bytes, state: dict, key: str) -> None:
     state[key] = _digest(content)
 
 
-def _create_shortcut(path: Path, launcher: Path) -> None:
+def _create_shortcut(path: Path, launcher: Path, desktop_exe: Path) -> None:
     python = shutil.which("py.exe") or shutil.which("py")
     if not python:
         raise SetupError("找不到 py 启动器；请先确认外部 PowerShell 可运行 py -3")
     environment = dict(os.environ, CODEX_CDP_LINK=str(path), CODEX_CDP_PY=python,
-                       CODEX_CDP_SCRIPT=str(launcher))
+                       CODEX_CDP_SCRIPT=str(launcher), CODEX_CDP_ICON=f"{desktop_exe},0")
     command = (
         "$shell = New-Object -ComObject WScript.Shell; "
         "$shortcut = $shell.CreateShortcut($env:CODEX_CDP_LINK); "
         "$shortcut.TargetPath = $env:CODEX_CDP_PY; "
         "$shortcut.Arguments = '-3 \"' + $env:CODEX_CDP_SCRIPT + '\" run --pause-on-error'; "
         "$shortcut.WorkingDirectory = [IO.Path]::GetDirectoryName($env:CODEX_CDP_SCRIPT); "
+        "$shortcut.IconLocation = $env:CODEX_CDP_ICON; "
         "$shortcut.Description = 'Start Codex Desktop with CDP'; "
         "$shortcut.Save()"
     )
@@ -280,7 +281,7 @@ def _create_shortcut(path: Path, launcher: Path) -> None:
         raise SetupError("无法在桌面创建 CDP 快捷方式")
 
 
-def _write_shortcut_owned(path: Path, launcher: Path, state: dict) -> None:
+def _write_shortcut_owned(path: Path, launcher: Path, desktop_exe: Path, state: dict) -> None:
     if path.is_symlink():
         raise SetupError(f"拒绝覆盖链接：{path}")
     if path.exists() and (state.get("desktop_shortcut_path") != str(path)
@@ -291,7 +292,7 @@ def _write_shortcut_owned(path: Path, launcher: Path, state: dict) -> None:
         temporary = Path(stream.name)
     temporary.unlink()
     try:
-        _create_shortcut(temporary, launcher)
+        _create_shortcut(temporary, launcher, desktop_exe)
         digest = _digest(temporary.read_bytes())
         temporary.replace(path)
     finally:
@@ -355,7 +356,7 @@ def add_user_path(entry: Path) -> bool:
 
 
 def install(mode: str) -> Path:
-    desktop_executable(package_directory())
+    desktop_exe = desktop_executable(package_directory())
     directory = support_directory()
     directory.mkdir(parents=True, exist_ok=True)
     state_path = directory / "setup-state.json"
@@ -366,7 +367,7 @@ def install(mode: str) -> Path:
     if mode == "app":
         output = desktop_directory() / DESKTOP_SHORTCUT_NAME
         _write_owned(launcher, source, state, "launcher_sha256")
-        _write_shortcut_owned(output, launcher, state)
+        _write_shortcut_owned(output, launcher, desktop_exe, state)
     else:
         _write_owned(launcher, source, state, "launcher_sha256")
         _write_owned(directory / COMMAND_NAME, TERMINAL_COMMAND, state, "command_sha256")

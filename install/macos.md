@@ -6,14 +6,14 @@
 
    ```sh
    python3 -c 'import sys; assert sys.version_info >= (3, 10), sys.version'
-   /Applications/ChatGPT.app/Contents/Resources/codex plugin --help
-   /Applications/ChatGPT.app/Contents/Resources/codex plugin marketplace list --json
+   /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex plugin --help
+   /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex plugin marketplace list --json
    ```
 
-   先确认 Desktop CLI 可执行插件命令。`stephen` 不在列表时执行 `/Applications/ChatGPT.app/Contents/Resources/codex plugin marketplace add .`；若它指向其他目录，先按[维护说明](maintenance.md)中的市场映射步骤修正。然后安装，并记录 JSON 返回的 `installedPath`：
+   先确认 Desktop CLI 可执行插件命令。`stephen` 不在列表时执行 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex plugin marketplace add .`；若它指向其他目录，先按[维护说明](maintenance.md)中的市场映射步骤修正。然后安装，并记录 JSON 返回的 `installedPath`：
 
    ```sh
-   /Applications/ChatGPT.app/Contents/Resources/codex plugin add codex-token-sidebar@stephen --json
+   /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex plugin add codex-token-sidebar@stephen --json
    ```
 
 2. **设置 CDP 启动方式并连接 Desktop。** 检查 `curl -fsS http://127.0.0.1:9222/json/list`：其中必须存在 URL 为 `app://-/index.html`（可带查询参数）的 Desktop 主页面。若 9222 被其他应用占用，先处理端口冲突。无论当前是否已连接，都要确认用户以后从哪里启动带 CDP 的 Desktop；已配置好固定入口时无需重复创建。
@@ -35,6 +35,6 @@
 
    验收条件：状态的 `version`、`fingerprint` 与源码身份一致，`installationPath` 等于第 1 步记录的 `installedPath`；`status=running`、`health.state=healthy`、`health.reader=ok`、`health.cdp=connected`、`health.mounted=true`、`health.lastSyncAt` 有值，并且侧栏显示 Token 面板。任务刚加载时可稍后复查。
 
-   若未启动，用 `python3 scripts/check_plugin_hooks.py --app-server /Applications/ChatGPT.app/Contents/Resources/codex --marketplace-path "$PWD/.agents/plugins/marketplace.json" --cwd "$PWD"` 只读检查 Hook；它只验证发现与信任状态。
+   若未启动，用 `python3 scripts/check_plugin_hooks.py --app-server /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex --marketplace-path "$PWD/.agents/plugins/marketplace.json" --cwd "$PWD"` 只读检查 Hook；它只验证发现与信任状态。
 
 更新、回退和卸载时再读取[维护说明](maintenance.md)。

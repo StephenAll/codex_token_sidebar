@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 
@@ -57,6 +57,17 @@ def _first_model(*objects: Any) -> str | None:
     return None
 
 
+def _identifier(value):
+    return value if isinstance(value, str) and value else ""
+
+
+def _model_evidence(models, turn, root_turn, *, owned=True, explicit=None):
+    if explicit:
+        return explicit, False
+    candidates = (models.get(turn) or models.get(root_turn) or set()) if owned else set()
+    return (next(iter(candidates)) if len(candidates) == 1 else "unknown", len(candidates) > 1)
+
+
 def _raw_usage(value: Any) -> dict[str, int] | None:
     if not isinstance(value, dict):
         return None
@@ -80,13 +91,8 @@ def _raw_usage(value: Any) -> dict[str, int] | None:
         "reasoning_tokens",
     )
     total_tokens = pick("total_tokens")
-    if total_tokens == 0 and (
-        input_tokens
-        or cached_input_tokens
-        or output_tokens
-        or reasoning_output_tokens
-    ):
-        total_tokens = input_tokens + output_tokens + reasoning_output_tokens
+    if "total_tokens" not in value:
+        total_tokens = input_tokens + output_tokens
     cached_input_tokens = min(cached_input_tokens, input_tokens)
     return {
         "input_tokens": input_tokens,
@@ -109,6 +115,21 @@ def _subtract_usage(
     }
 
 
+def _legacy_usage(current, previous, last):
+    """Return observed contribution and any uncertainty in cumulative evidence."""
+    if current is None or previous is None:
+        return (last if last is not None else current), None
+    delta = {key: current[key] - previous[key] for key in TOKEN_FIELDS}
+    if not any(delta.values()):
+        return _empty_totals(), None
+    if all(value >= 0 for value in delta.values()):
+        inconsistent = last is not None and any(last[key] > delta[key] for key in TOKEN_FIELDS)
+        return delta, "legacy_cumulative_inconsistent" if inconsistent else None
+    if all(value <= 0 for value in delta.values()) and last == current:
+        return current, None
+    return (last if last is not None else _empty_totals()), "legacy_cumulative_inconsistent"
+
+
 @dataclass(frozen=True)
 class UsageEvent:
     session_id: str
@@ -119,19 +140,20 @@ class UsageEvent:
     output_tokens: int
     reasoning_output_tokens: int
     total_tokens: int
+    observation: tuple = ()
+    feature: str = FEATURE_TASKS
 
     def dedupe_key(self) -> tuple[Any, ...]:
         return (
             self.session_id,
             self.model,
-            self.timestamp,
+            self.observation or self.timestamp,
             self.input_tokens,
             self.cached_input_tokens,
             self.output_tokens,
             self.reasoning_output_tokens,
             self.total_tokens,
         )
-
 
 @dataclass(frozen=True)
 class UsageRecord:
@@ -148,10 +170,21 @@ class UsageRecord:
     output_tokens: int
     reasoning_output_tokens: int
     total_tokens: int
+    metadata_owned: bool = True
+    identity_complete: bool = True
+    local_identity: tuple = ()
+    model_ambiguous: bool = False
+    feature_known: bool = True
+
+    def coverage_identity(self):
+        return (self.session_id, self.response_id, self.turn_id,
+                *(getattr(self, key) for key in TOKEN_FIELDS))
 
     def dedupe_key(self) -> tuple[Any, ...]:
         if self.response_id:
             return (self.session_id, self.response_id)
+        if self.local_identity:
+            return self.local_identity
         return (
             self.session_id,
             self.turn_id,
@@ -178,7 +211,7 @@ def _event_from_usage(
     return UsageEvent(
         session_id=session_id,
         timestamp=str(timestamp or ""),
-        model=model or "gpt-5",
+        model=model or "unknown",
         input_tokens=usage["input_tokens"],
         cached_input_tokens=usage["cached_input_tokens"],
         output_tokens=usage["output_tokens"],
@@ -192,6 +225,8 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
     events: list[UsageEvent] = []
     previous_total: dict[str, int] | None = None
     current_model: str | None = None
+    generation = 0
+    thread_source = None
 
     for line in text.splitlines():
         # Most rollout lines are messages, tool calls, or reasoning content.
@@ -201,6 +236,7 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
             '"token_count"' not in line
             and '"turn_context"' not in line
             and '"usage"' not in line
+            and '"session_meta"' not in line
         ):
             continue
         try:
@@ -212,6 +248,10 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
 
         entry_type = entry.get("type")
         payload = entry.get("payload")
+        if entry_type == "session_meta" and isinstance(payload, dict):
+            session_id = _identifier(payload.get("id")) or session_id
+            thread_source = payload.get("thread_source") or payload.get("source")
+            continue
         if entry_type == "turn_context" and isinstance(payload, dict):
             current_model = _first_model(payload) or current_model
             continue
@@ -224,9 +264,10 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
                 continue
             total_usage = _raw_usage(info.get("total_token_usage"))
             last_usage = _raw_usage(info.get("last_token_usage"))
-            usage = last_usage
-            if usage is None and total_usage is not None:
-                usage = _subtract_usage(total_usage, previous_total)
+            usage, _ = _legacy_usage(total_usage, previous_total, last_usage)
+            if (total_usage is not None and previous_total is not None
+                    and total_usage["total_tokens"] < previous_total["total_tokens"]):
+                generation += 1
             if total_usage is not None:
                 previous_total = total_usage
             model = _first_model(payload, info) or current_model
@@ -239,6 +280,9 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
                 usage,
             )
             if event:
+                event = replace(event, feature=_feature_for_record(thread_source, {}, event.model))
+                if total_usage is not None:
+                    event = replace(event, observation=(generation, *(total_usage[k] for k in TOKEN_FIELDS)))
                 events.append(event)
             continue
 
@@ -264,6 +308,7 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
                 usage,
             )
             if event:
+                event = replace(event, feature=_feature_for_record(thread_source, {}, event.model))
                 events.append(event)
 
     deduped: dict[tuple[Any, ...], UsageEvent] = {}
@@ -295,10 +340,11 @@ def _feature_for_record(
     return FEATURE_TASKS
 
 
-def parse_usage_records(text: str, session_id: str) -> list[UsageRecord]:
+def parse_usage_records(text: str, session_id: str, *, source_id: str | None = None) -> list[UsageRecord]:
     """Parse per-response usage records and attach feature/model metadata."""
-    model_by_turn: dict[str, str] = {}
+    model_by_turn: dict[str, set[str]] = defaultdict(set)
     thread_source: Any = None
+    execution_id = session_id
     raw_records: list[tuple[str, dict[str, Any]]] = []
 
     for line in text.splitlines():
@@ -321,30 +367,31 @@ def parse_usage_records(text: str, session_id: str) -> list[UsageRecord]:
         entry_type = entry.get("type")
         if entry_type == "session_meta":
             thread_source = payload.get("thread_source") or payload.get("source")
+            if isinstance(payload.get("id"), str) and payload["id"]:
+                execution_id = payload["id"]
         elif entry_type == "turn_context":
             turn_id = payload.get("turn_id")
             model = _first_model(payload)
             if isinstance(turn_id, str) and model:
-                model_by_turn[turn_id] = model
+                model_by_turn[turn_id].add(model)
         elif entry_type == "token_usage_record":
             raw_records.append((str(entry.get("timestamp") or ""), payload))
 
     records: dict[tuple[Any, ...], UsageRecord] = {}
-    for timestamp, payload in raw_records:
+    for sequence, (timestamp, payload) in enumerate(raw_records, 1):
         usage = _raw_usage(payload.get("usage"))
         if usage is None:
             continue
         turn_id = str(payload.get("turn_id") or "")
         root_turn_id = str(payload.get("root_turn_id") or "")
-        model = (
-            model_by_turn.get(turn_id)
-            or model_by_turn.get(root_turn_id)
-            or "unknown"
-        )
+        thread_id = _identifier(payload.get("thread_id"))
+        owned = not thread_id or thread_id == execution_id
+        model, ambiguous = _model_evidence(model_by_turn, turn_id, root_turn_id,
+                                   owned=owned, explicit=_first_model(payload))
         record = UsageRecord(
-            session_id=session_id,
+            session_id=thread_id or execution_id,
             timestamp=timestamp,
-            response_id=str(payload.get("response_id") or ""),
+            response_id=_identifier(payload.get("response_id")),
             turn_id=turn_id,
             feature=_feature_for_record(thread_source, {
                 "session_id": str(payload.get("session_id") or session_id),
@@ -358,6 +405,10 @@ def parse_usage_records(text: str, session_id: str) -> list[UsageRecord]:
             output_tokens=usage["output_tokens"],
             reasoning_output_tokens=usage["reasoning_output_tokens"],
             total_tokens=usage["total_tokens"],
+            metadata_owned=owned,
+            identity_complete=bool(thread_id and _identifier(payload.get("response_id"))),
+            local_identity=("anonymous", source_id or session_id, sequence),
+            model_ambiguous=ambiguous, feature_known=thread_source is not None,
         )
         records[record.dedupe_key()] = record
     return list(records.values())
@@ -408,18 +459,38 @@ def _rows_by_key(
     return rows
 
 
+def merge_usage_sources(records: Iterable[UsageRecord]) -> UsageRecord | None:
+    """Merge evidence for one response; missing metadata is not a retraction."""
+    records = list(records)
+    if not records:
+        return None
+    owned = [record for record in records if record.metadata_owned]
+    candidates = owned or records
+    winner = candidates[-1]
+    models = {record.model for record in candidates if record.model != "unknown"}
+    ambiguous = len(models) > 1 or any(record.model_ambiguous for record in candidates)
+    feature = next((record.feature for record in reversed(candidates) if record.feature_known), winner.feature)
+    return replace(winner, model=next(iter(models)) if len(models) == 1 and not ambiguous else "unknown",
+                   model_ambiguous=ambiguous, feature=feature,
+                   feature_known=any(record.feature_known for record in candidates),
+                   identity_complete=any(record.identity_complete for record in candidates))
+
+
 def aggregate_usage_records(records: Iterable[UsageRecord]) -> dict[str, Any]:
     total = _empty_totals()
     by_model: dict[str, dict[str, int]] = {}
     by_feature: dict[str, dict[str, int]] = {}
     model_request_ids: dict[str, set[str]] = {}
-    materialized = list(records)
+    selected = defaultdict(list)
+    for record in records:
+        selected[record.dedupe_key()].append(record)
+    materialized = [merge_usage_sources(bucket) for bucket in selected.values()]
     for record in materialized:
         _add_totals(total, record)
         _add_totals(by_model.setdefault(record.model, _empty_totals()), record)
         _add_totals(by_feature.setdefault(record.feature, _empty_totals()), record)
         if record.response_id:
-            model_request_ids.setdefault(record.model, set()).add(record.response_id)
+            model_request_ids.setdefault(record.model, set()).add(record.dedupe_key())
     for feature in FEATURE_ORDER:
         by_feature.setdefault(feature, _empty_totals())
     model_rows = _rows_by_key(
@@ -439,18 +510,20 @@ def aggregate_usage_records(records: Iterable[UsageRecord]) -> dict[str, Any]:
             "feature",
             total["total_tokens"],
         ),
-        "request_count": len({record.response_id for record in materialized if record.response_id}),
-        "turn_count": len({record.turn_id for record in materialized if record.turn_id}),
+        "request_count": len({record.dedupe_key() for record in materialized if record.response_id}),
+        "turn_count": len({(record.session_id, record.turn_id) for record in materialized if record.turn_id}),
     }
 
 
 def aggregate_events(events: Iterable[UsageEvent]) -> dict[str, Any]:
     total = _empty_totals()
     by_model: dict[str, dict[str, int]] = {}
+    features = {}
     for event in events:
         _add_totals(total, event)
         row = by_model.setdefault(event.model, _empty_totals())
         _add_totals(row, event)
+        _add_totals(features.setdefault(event.feature, _empty_totals()), event)
     models = _rows_by_key(
         by_model,
         "model",
@@ -459,7 +532,10 @@ def aggregate_events(events: Iterable[UsageEvent]) -> dict[str, Any]:
     )
     for row in models:
         row["request_count"] = None
-    return {"total": total, "by_model": models}
+    result = {"total": total, "by_model": models}
+    if features:
+        result["by_feature"] = _rows_by_key(features, "feature", total["total_tokens"])
+    return result
 
 
 class UsageAccumulator:
@@ -467,10 +543,12 @@ class UsageAccumulator:
 
     def __init__(self, *, modern: bool) -> None:
         self.modern = modern
+        self.incomplete_identities = 0
         self.items: dict[tuple[Any, ...], UsageRecord | UsageEvent] = {}
         self.total = _empty_totals()
         self.models: dict[str, dict[str, int]] = {}
         self.features: dict[str, dict[str, int]] = {}
+        self.feature_sizes = Counter()
         self.model_sizes: Counter = Counter()
         self.requests: Counter = Counter()
         self.turns: Counter = Counter()
@@ -484,15 +562,21 @@ class UsageAccumulator:
                 del counter[key]
 
     def _adjust(self, item: UsageRecord | UsageEvent, delta: int) -> None:
-        groups = [self.total, self.models.setdefault(item.model, _empty_totals())]
+        groups = [self.total, self.models.setdefault(item.model, _empty_totals()),
+                  self.features.setdefault(item.feature, _empty_totals())]
         if isinstance(item, UsageRecord):
-            groups.append(self.features.setdefault(item.feature, _empty_totals()))
-            self._count(self.requests, item.response_id, delta)
-            self._count(self.turns, item.turn_id, delta)
-            self._count(self.model_requests.setdefault(item.model, Counter()), item.response_id, delta)
+            self.incomplete_identities += delta * (not item.identity_complete)
+            request = item.dedupe_key() if item.response_id else None
+            turn = (item.session_id, item.turn_id) if item.turn_id else None
+            self._count(self.requests, request, delta)
+            self._count(self.turns, turn, delta)
+            self._count(self.model_requests.setdefault(item.model, Counter()), request, delta)
         for group in groups:
             for field in TOKEN_FIELDS:
                 group[field] += getattr(item, field) * delta
+        self._count(self.feature_sizes, item.feature, delta)
+        if item.feature not in self.feature_sizes:
+            self.features.pop(item.feature, None)
         self._count(self.model_sizes, item.model, delta)
         if item.model not in self.model_sizes:
             del self.models[item.model]
@@ -518,7 +602,178 @@ class UsageAccumulator:
             features = {key: self.features.get(key, _empty_totals()) for key in FEATURE_ORDER}
             result.update(by_feature=_rows_by_key(features, "feature", self.total["total_tokens"]),
                           request_count=len(self.requests), turn_count=len(self.turns))
+        elif self.items:
+            result["by_feature"] = _rows_by_key(self.features, "feature", self.total["total_tokens"])
         return result
+
+
+class UsageByThread:
+    """Index replaceable contributions; only execution threads own counters."""
+
+    def __init__(self, *, modern: bool) -> None:
+        self.modern = modern
+        self.threads: dict[str, UsageAccumulator] = {}
+        self._owners: dict[tuple, str] = {}
+
+    def set(self, key: tuple[Any, ...], item: UsageRecord | UsageEvent | None) -> None:
+        previous = self._owners.get(key)
+        owner = item.session_id if item is not None else None
+        if previous is not None and previous != owner:
+            group = self.threads[previous]
+            group.set(key, None)
+            if not group.items:
+                del self.threads[previous]
+            del self._owners[key]
+        if item is not None:
+            if owner not in self.threads:
+                self.threads[owner] = UsageAccumulator(modern=self.modern)
+            self.threads[owner].set(key, item)
+            self._owners[key] = owner
+
+
+def summarize_coverage(modern: UsageByThread, legacy: UsageByThread, *, covered_threads=()) -> dict:
+    """Select overlapping formats per execution, then combine disjoint threads."""
+    total, models, features = _empty_totals(), {}, {}
+    requests = turns = events = 0
+    model_requests = {}
+    usage_limits, credit_limits = set(), set()
+    for thread in modern.threads.keys() | legacy.threads.keys():
+        current, old = modern.threads.get(thread), legacy.threads.get(thread)
+        group = current or old
+        report = group.report()
+        if current and old and thread not in covered_threads:
+            usage_limits.add("overlap_unresolved")
+            credit_limits.add("missing_response_records")
+            requests = turns = None
+        if current:
+            if current.incomplete_identities:
+                usage_limits.add("response_identity_missing")
+                requests = turns = None
+            if requests is not None:
+                requests += report["request_count"]
+                turns += report["turn_count"]
+        else:
+            requests = turns = None
+            events += len(old.items)
+            credit_limits.add("missing_response_records")
+        for field in TOKEN_FIELDS:
+            total[field] += report["total"][field]
+        for row in report["by_model"]:
+            target = models.setdefault(row["model"], _empty_totals())
+            for field in TOKEN_FIELDS:
+                target[field] += row[field]
+            count = (None if current and (current.incomplete_identities
+                     or (old and thread not in covered_threads)) else row["request_count"])
+            previous = model_requests.get(row["model"], 0)
+            model_requests[row["model"]] = None if count is None or previous is None else previous + count
+        rows = report.get("by_feature", [{"feature": FEATURE_TASKS, **report["total"]}])
+        for row in rows:
+            target = features.setdefault(row["feature"], _empty_totals())
+            for field in TOKEN_FIELDS:
+                target[field] += row[field]
+    model_rows = _rows_by_key(models, "model", total["total_tokens"], True)
+    for row in model_rows:
+        row["request_count"] = model_requests[row["model"]]
+    if modern.threads:
+        for feature in FEATURE_ORDER:
+            features.setdefault(feature, _empty_totals())
+    else:
+        requests = turns = None
+    return {"total": total, "by_model": model_rows,
+            "by_feature": _rows_by_key(features, "feature", total["total_tokens"]),
+            "request_count": requests, "turn_count": turns, "event_count": events,
+            "usage_limits": usage_limits, "credit_limits": credit_limits}
+
+
+class CoverageEvidence:
+    """Prove overlap only through closed cumulative checkpoints in one source.
+
+    Matching aggregate numbers alone do not identify a range. Unsupported or
+    reset ranges remain partial; ordinary appends update these sets in O(1).
+    """
+    def __init__(self, execution_id):
+        self.execution_id = execution_id
+        self.turn = None
+        self.records = {}
+        self.record_proofs = {}
+        self.total = _empty_totals()
+        self.modern_points = set()
+        self.missing_points = set()
+        self.has_legacy = False
+        self.unconfirmed = False
+        self.previous_legacy = None
+        self.usage_limitations = set()
+
+    @staticmethod
+    def vector(usage):
+        if (not isinstance(usage, dict)
+                or any(type(usage.get(key)) is not int or usage[key] < 0 for key in TOKEN_FIELDS)):
+            return None
+        return tuple(usage[key] for key in TOKEN_FIELDS)
+
+    def feed(self, entry):
+        kind, payload = entry.get("type"), entry.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if kind == "session_meta":
+            identity = _identifier(payload.get("id"))
+            if identity:
+                if identity != self.execution_id and (self.records or self.has_legacy):
+                    self.unconfirmed = True
+                self.execution_id = identity
+        elif kind == "turn_context":
+            self.turn = _identifier(payload.get("turn_id"))
+        elif kind == "token_usage_record" and payload.get("thread_id") == self.execution_id:
+            response = _identifier(payload.get("response_id"))
+            usage = _raw_usage(payload.get("usage"))
+            if not response or usage is None:
+                self.unconfirmed = True
+                return
+            previous = self.records.get(response)
+            checkpoint = self.vector(payload.get("thread_token_usage"))
+            turn = _identifier(payload.get("turn_id"))
+            proof = (turn, checkpoint)
+            if previous is not None and (previous != usage or self.record_proofs[response] != proof):
+                # A revision can invalidate earlier prefix proofs. A full file
+                # replacement rebuilds evidence; don't reuse those old proofs.
+                self.unconfirmed = True
+            for key in TOKEN_FIELDS:
+                self.total[key] += usage[key] - (previous[key] if previous else 0)
+            self.records[response] = usage
+            self.record_proofs[response] = proof
+            if turn and checkpoint is not None and checkpoint == self.vector(self.total):
+                point = (turn, checkpoint)
+                self.modern_points.add(point)
+                self.missing_points.discard(point)
+        elif kind == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                return
+            total = _raw_usage(info.get("total_token_usage"))
+            contribution, limitation = _legacy_usage(total, self.previous_legacy, _raw_usage(info.get("last_token_usage")))
+            if limitation:
+                self.usage_limitations.add(limitation)
+            if (total is not None and self.previous_legacy is not None
+                    and total["total_tokens"] < self.previous_legacy["total_tokens"]):
+                self.unconfirmed = True
+            self.previous_legacy = total if total is not None else self.previous_legacy
+            if contribution is None or not any(contribution.values()):
+                return
+            self.has_legacy = True
+            checkpoint = self.vector(info.get("total_token_usage"))
+            if not self.turn or checkpoint is None:
+                self.unconfirmed = True
+            elif (self.turn, checkpoint) not in self.modern_points:
+                self.missing_points.add((self.turn, checkpoint))
+        if kind not in {"session_meta", "turn_context", "event_msg"}:
+            if _raw_usage(entry.get("usage")) is not None or any(
+                    isinstance(entry.get(key), dict) and "usage" in entry[key]
+                    for key in ("data", "result", "response")):
+                self.has_legacy = self.unconfirmed = True
+
+    @property
+    def covered(self):
+        return self.has_legacy and not self.unconfirmed and not self.missing_points
 
 
 class UsageStream:
@@ -530,12 +785,15 @@ class UsageStream:
     Ordinary message bodies are never retained.
     """
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, *, source_id: str | None = None) -> None:
         self.session_id = session_id
-        self.credits = CreditEvidence(session_id)
+        self.source_id = source_id or session_id
+        self.execution_id = session_id
+        self.credits = CreditEvidence()
+        self.coverage = CoverageEvidence(session_id)
         self.records: dict[tuple[Any, ...], UsageRecord] = {}
         self.events: dict[tuple[Any, ...], UsageEvent] = {}
-        self._models: dict[str, str] = {}
+        self._models: dict[str, set[str]] = defaultdict(set)
         self._source: Any = None
         self._raw: dict[tuple[Any, ...], tuple[int, str, dict[str, Any]]] = {}
         self._dependencies: dict[str, set] = defaultdict(set)
@@ -544,6 +802,8 @@ class UsageStream:
         self._sequence = 0
         self._legacy_model: str | None = None
         self._legacy_total: dict[str, int] | None = None
+        self._legacy_generation = 0
+        self.usage_limitations = self.coverage.usage_limitations
         self._record_changes: dict[tuple[Any, ...], UsageRecord | None] = {}
         self._event_changes: dict[tuple[Any, ...], UsageEvent | None] = {}
 
@@ -566,33 +826,39 @@ class UsageStream:
             self._buckets[key].pop(raw_key)
             self._winner(key)
         sequence, timestamp, payload = self._raw[raw_key]
-        model = self._models.get(payload["turn_id"]) or self._models.get(payload["root_turn_id"]) or "unknown"
+        owned = not payload["thread_id"] or payload["thread_id"] == self.execution_id
+        model, ambiguous = _model_evidence(self._models, payload["turn_id"], payload["root_turn_id"],
+                                  owned=owned, explicit=payload.get("model"))
         record = UsageRecord(
-            session_id=self.session_id, timestamp=timestamp, response_id=payload["response_id"],
+            session_id=payload["thread_id"] or self.execution_id,
+            timestamp=timestamp, response_id=payload["response_id"],
             turn_id=payload["turn_id"], model=model,
+            metadata_owned=owned,
+            identity_complete=bool(payload["thread_id"] and payload["response_id"]),
+            local_identity=("anonymous", self.source_id, payload["local_sequence"]),
+            model_ambiguous=ambiguous, feature_known=self._source is not None,
             feature=_feature_for_record(self._source, payload, model), **payload["usage"])
         self._attributed[raw_key] = record
         key = record.dedupe_key()
         self._buckets.setdefault(key, {})[raw_key] = (sequence, record)
         self._winner(key)
 
-    def _modern_record(self, timestamp: str, payload: dict[str, Any]) -> None:
+    def _modern_record(self, timestamp: str, payload: dict[str, Any], raw_key: tuple) -> None:
         usage = _raw_usage(payload.get("usage"))
         if usage is None:
             return
-        normalized = {key: str(payload.get(key) or "") for key in (
+        normalized = {key: _identifier(payload.get(key)) for key in (
             "response_id", "turn_id", "root_turn_id", "thread_id")}
         normalized["session_id"] = str(payload.get("session_id") or self.session_id)
         normalized["usage"] = usage
-        raw_key = (("response", normalized["response_id"]) if normalized["response_id"] else
-                   ("anonymous", timestamp, json.dumps(normalized, sort_keys=True)))
+        normalized["local_sequence"] = self._sequence
+        normalized["model"] = _first_model(payload)
         previous = self._raw.get(raw_key)
         if previous:
             for turn in {previous[2]["turn_id"], previous[2]["root_turn_id"]}:
                 self._dependencies[turn].discard(raw_key)
                 if not self._dependencies[turn]:
                     del self._dependencies[turn]
-        self._sequence += 1
         self._raw[raw_key] = (self._sequence, timestamp, normalized)
         for turn in {normalized["turn_id"], normalized["root_turn_id"]}:
             self._dependencies[turn].add(raw_key)
@@ -611,11 +877,24 @@ class UsageStream:
             return
         if not isinstance(entry, dict):
             return
-        self.credits.feed(entry)
         kind, payload = entry.get("type"), entry.get("payload")
+        previous_execution = self.execution_id
+        response_key = None
+        if isinstance(payload, dict):
+            if kind == "session_meta":
+                self.execution_id = _identifier(payload.get("id")) or self.execution_id
+            elif kind == "token_usage_record":
+                # Count even unusable records so both consumers share stable
+                # source-local identities when an anonymous response is skipped.
+                self._sequence += 1
+                thread, response = _identifier(payload.get("thread_id")), _identifier(payload.get("response_id"))
+                response_key = ((thread or self.execution_id, response) if response
+                                else ("anonymous", self.source_id, self._sequence))
+        self.coverage.feed(entry)
+        self.credits.feed(entry, execution_id=self.execution_id, response_key=response_key)
         if kind == "session_meta" and isinstance(payload, dict):
             source = payload.get("thread_source") or payload.get("source")
-            if source != self._source:
+            if source != self._source or previous_execution != self.execution_id:
                 self._source = source
                 for key in self._raw:
                     self._attribute(key)
@@ -624,23 +903,34 @@ class UsageStream:
             model = _first_model(payload)
             self._legacy_model = model or self._legacy_model
             turn = payload.get("turn_id")
-            if isinstance(turn, str) and model and self._models.get(turn) != model:
-                self._models[turn] = model
+            if isinstance(turn, str) and model and model not in self._models[turn]:
+                self._models[turn].add(model)
                 for key in self._dependencies.get(turn, ()):
                     self._attribute(key)
             return
         if kind == "token_usage_record" and isinstance(payload, dict):
-            self._modern_record(str(entry.get("timestamp") or ""), payload)
+            self._modern_record(str(entry.get("timestamp") or ""), payload, response_key)
             if not any(key in entry for key in ("usage", "data", "result", "response")):
                 return
 
         # Reuse the batch legacy parser on one line plus a zero-contribution
         # cursor prelude. Its alias handling and headless formats stay canonical.
-        prefix = json.dumps({"type": "turn_context", "payload": {"model": self._legacy_model}}) + "\n"
+        prefix = json.dumps({"type": "session_meta", "payload": {"thread_source": self._source}}) + "\n"
+        prefix += json.dumps({"type": "turn_context", "payload": {"model": self._legacy_model}}) + "\n"
         if self._legacy_total is not None:
             prefix += json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
                 "total_token_usage": self._legacy_total, "last_token_usage": {}}}}) + "\n"
-        for event in parse_usage_text(prefix + line, self.session_id):
+        total = None
+        if kind == "event_msg" and isinstance(payload, dict) and payload.get("type") == "token_count":
+            info = payload.get("info")
+            if isinstance(info, dict):
+                total = _raw_usage(info.get("total_token_usage"))
+                if (total is not None and self._legacy_total is not None
+                        and total["total_tokens"] < self._legacy_total["total_tokens"]):
+                    self._legacy_generation += 1
+        for event in parse_usage_text(prefix + line, self.execution_id):
+            if event.observation:
+                event = replace(event, observation=(self._legacy_generation, *event.observation[1:]))
             key = event.dedupe_key()
             if self.events.get(key) != event:
                 self.events[key] = event
@@ -661,9 +951,7 @@ class UsageStream:
 
 class CreditEvidence:
     """Retain only pricing evidence, with chronological tiers and turn-local models."""
-    def __init__(self, session_id):
-        self.session_id = session_id
-        self.execution_id = session_id
+    def __init__(self):
         self.provider = None
         self.tier = None
         self.active_turn = None
@@ -674,7 +962,6 @@ class CreditEvidence:
         self.records = {}
         self.changes = {}
         self.limitations = set()
-        self.sequence = 0
         self.thread_totals = Counter()
         self.cumulative = {}
 
@@ -683,33 +970,35 @@ class CreditEvidence:
         if not isinstance(value, str): return None
         return {'default': 'standard', 'priority': 'fast'}.get(value, value)
 
-    def _attribute(self, key):
+    def _attribute(self, key, execution_id):
         raw = self.raw[key]
         turn = raw['turn']
-        models = self.models[turn] if key[0] == self.execution_id else set()
-        record = {k: v for k, v in raw.items() if k != 'turn'}
-        record.update(provider=self.provider,
-                      model=next(iter(models)) if len(models) == 1 else None,
-                      modelAmbiguous=len(models) > 1,
-                      tierAmbiguous=len(self.tiers[turn]) > 1)
+        owned = key[0] == execution_id
+        # Pricing requires evidence for the actual turn. A root-turn fallback
+        # may describe an upstream model, not the model that served this call.
+        model, ambiguous = _model_evidence(self.models, turn, None,
+                                            owned=owned, explicit=raw.get('explicitModel'))
+        record = {k: v for k, v in raw.items() if k not in ('turn', 'rootTurn', 'explicitModel')}
+        record.update(provider=self.provider if owned else None,
+                      metadataOwned=owned,
+                      model=model if model != 'unknown' else None,
+                      modelAmbiguous=ambiguous,
+                      tierAmbiguous=owned and len(self.tiers[turn]) > 1)
         if record != self.records.get(key):
             self.records[key] = record
             self.changes[key] = record
 
-    def _revisit(self, turn):
-        for key in self.dependencies[turn]: self._attribute(key)
+    def _revisit(self, turn, execution_id):
+        for key in self.dependencies[turn]: self._attribute(key, execution_id)
 
-    def feed(self, entry):
+    def feed(self, entry, *, execution_id, response_key):
         kind, payload = entry.get('type'), entry.get('payload')
         if not isinstance(payload, dict): return
         if kind == 'session_meta':
-            identity = payload.get('id')
-            if isinstance(identity, str) and identity:
-                self.execution_id = identity
             provider = payload.get('model_provider')
             if isinstance(provider, str) and provider != self.provider:
                 self.provider = provider
-                for key in self.raw: self._attribute(key)
+                for key in self.raw: self._attribute(key, execution_id)
         elif kind == 'turn_context':
             turn = payload.get('turn_id')
             self.active_turn = turn if isinstance(turn, str) and turn else None
@@ -718,21 +1007,21 @@ class CreditEvidence:
                 if model: self.models[turn].add(model)
                 if 'service_tier' in payload: self.tier = self._tier(payload['service_tier'])
                 if self.tier is not None: self.tiers[turn].add(self.tier)
-                self._revisit(turn)
+                self._revisit(turn, execution_id)
             if payload.get('realtime_active'): self.limitations.add('unsupported_media')
         elif kind == 'event_msg' and payload.get('type') == 'thread_settings_applied':
             settings = payload.get('thread_settings')
             self.tier = self._tier(settings.get('service_tier')) if isinstance(settings, dict) else None
             # Only tiers observed at a response or context belong to that turn.
         elif kind == 'token_usage_record':
-            self.sequence += 1
-            thread, response = payload.get('thread_id'), payload.get('response_id')
-            identity = all(isinstance(v, str) and v for v in (thread, response))
-            key = (thread, response) if identity else ('anonymous', self.session_id, self.sequence)
+            thread, response = _identifier(payload.get('thread_id')), _identifier(payload.get('response_id'))
+            identity = bool(thread and response)
+            key = response_key
             turn = payload.get('turn_id')
             turn = turn if isinstance(turn, str) and turn else None
             if key in self.raw:
-                self.dependencies[self.raw[key]['turn']].discard(key)
+                for dependency in (self.raw[key]['turn'], self.raw[key].get('rootTurn')):
+                    self.dependencies[dependency].discard(key)
                 old_usage = self.raw[key].get('usage') or {}
                 old_total = old_usage.get('total_tokens')
                 if identity and type(old_total) is int and old_total >= 0:
@@ -741,7 +1030,10 @@ class CreditEvidence:
             old_tiers = len(self.tiers[turn])
             if tier is not None: self.tiers[turn].add(tier)
             usage = payload.get('usage')
+            root_turn = payload.get('root_turn_id')
+            root_turn = root_turn if isinstance(root_turn, str) and root_turn else None
             self.raw[key] = {'recordKey': key, 'hasResponseIdentity': identity, 'turn': turn,
+                             'rootTurn': root_turn, 'explicitModel': _first_model(payload),
                              'serviceTier': tier, 'usage': {k: usage[k] for k in (
                                  *TOKEN_FIELDS, 'cache_write_input_tokens') if k in usage}
                              if isinstance(usage, dict) else None}
@@ -757,9 +1049,10 @@ class CreditEvidence:
             else:
                 self.limitations.discard('history_detail_missing')
             self.dependencies[turn].add(key)
+            self.dependencies[root_turn].add(key)
             if len(self.tiers[turn]) > 1 and len(self.tiers[turn]) != old_tiers:
-                self._revisit(turn)
-            else: self._attribute(key)
+                self._revisit(turn, execution_id)
+            else: self._attribute(key, execution_id)
         if kind == 'history_base' or payload.get('history_base') is not None:
             self.limitations.add('history_scope_unconfirmed')
         subtype = str(payload.get('type') or '')

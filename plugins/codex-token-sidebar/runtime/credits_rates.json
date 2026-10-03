@@ -1,28 +1,81 @@
 {
-  "id": "chatgpt-credits-reference-2026-09-23-r2",
-  "basis": "published_reference_snapshot_not_historical_invoice",
-  "verifiedOn": "2026-09-23",
+  "id": "official-d36e22fde21c3d11dd7c0d48a7d6054252fa314a1cc71f43508c8741404cfbf5",
   "unit": "credits_per_million_tokens",
-  "cacheWritePolicy": "included_in_input_no_separate_charge",
-  "sources": [
-    "https://learn.chatgpt.com/docs/pricing",
-    "https://learn.chatgpt.com/docs/agent-configuration/speed",
-    "https://learn.chatgpt.com/docs/config-file/config-reference",
-    "https://learn.chatgpt.com/docs/models"
-  ],
   "models": {
-    "gpt-6-astra": {"input": "250", "cachedInput": "25", "output": "1250", "fastMultiplier": "2.5"},
-    "gpt-6-sol": {"input": "50", "cachedInput": "5", "output": "250", "fastMultiplier": "2.5"},
-    "gpt-6-luna": {"input": "2.5", "cachedInput": "0.25", "output": "12.5", "fastMultiplier": "2.5"},
-    "gpt-5.6-sol": {"input": "100", "cachedInput": "10", "output": "500", "fastMultiplier": "2.5"},
-    "gpt-5.6-terra": {"input": "50", "cachedInput": "5", "output": "300", "fastMultiplier": "2.5"},
-    "gpt-5.6-luna": {"input": "5", "cachedInput": "0.5", "output": "30", "fastMultiplier": "2.5"}
+    "gpt-6-astra": {
+      "input": "250",
+      "cachedInput": "25",
+      "output": "1250",
+      "fastMultiplier": "2",
+      "ultrafastMultiplier": "6"
+    },
+    "gpt-6.1-sol": {
+      "input": "50",
+      "cachedInput": "2.5",
+      "output": "250",
+      "fastMultiplier": "2"
+    },
+    "gpt-6-sol": {
+      "input": "50",
+      "cachedInput": "5",
+      "output": "250",
+      "fastMultiplier": "2"
+    },
+    "gpt-6-luna": {
+      "input": "2.5",
+      "cachedInput": "0.25",
+      "output": "12.5",
+      "fastMultiplier": "2"
+    },
+    "gpt-5.6-sol": {
+      "input": "100",
+      "cachedInput": "10",
+      "output": "500",
+      "fastMultiplier": "2"
+    },
+    "gpt-5.6-terra": {
+      "input": "50",
+      "cachedInput": "5",
+      "output": "300",
+      "fastMultiplier": "2"
+    },
+    "gpt-5.6-luna": {
+      "input": "5",
+      "cachedInput": "0.5",
+      "output": "30",
+      "fastMultiplier": "2"
+    },
+    "gpt-5.5": {
+      "input": "125",
+      "cachedInput": "12.5",
+      "output": "750",
+      "fastMultiplier": "2"
+    }
   },
-  "tierAliases": {"default": "standard", "standard": "standard", "priority": "fast", "fast": "fast"},
+  "tierAliases": {
+    "default": "standard",
+    "standard": "standard",
+    "priority": "fast",
+    "fast": "fast",
+    "ultrafast": "ultrafast"
+  },
+  "cacheWritePolicy": "included_in_input_no_separate_charge",
+  "basis": "published_reference_snapshot_not_historical_invoice",
+  "sources": [
+    "https://learn.chatgpt.com/docs/pricing.md",
+    "https://learn.chatgpt.com/docs/agent-configuration/speed.md",
+    "https://learn.chatgpt.com/docs/models.md"
+  ],
+  "verifiedOn": "2026-10-03",
+  "sourceHashes": {
+    "pricing": "a24cb2c8bb026f4dec45f36e9452ecca3be20d30ced987ed61cc95c540654c1e",
+    "models": "4ec433ea907935c05961dfc6617f314e8d04e60c571be30587f2ce415710f428",
+    "speed": "4609fbd0a6e3b87863a7ae089c5b33868dbc2b20940b5ceb9a155d6514ab6ed7"
+  },
   "notes": [
-    "Codex credit billing has no separate cache-write charge; cache-write tokens do not add another fee beyond input pricing.",
-    "Sol promotional pricing is published as available at least through 2026-11-21; revalidate before subsequent release updates.",
-    "No public price was established for codex-auto-review. Missing tiers remain unpriced.",
-    "This reference card does not reproduce subscription allowance debits, historical tariffs or final invoices."
+    "Reference prices for purchased credits, not included subscription allowance debits or historical invoices.",
+    "Fast uses 2x purchased-credit rates; GPT-6 Astra Ultrafast uses 6x. Subscription allowance multipliers are different.",
+    "GPT-5.6 Sol promotional pricing is published as available at least through 2026-11-21.",
+    "Unknown model IDs and unsupported speed tiers remain unpriced; image token pricing is not inferred from text rates."
   ]
 }

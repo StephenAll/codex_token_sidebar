@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import http.client
 import json
@@ -26,6 +27,7 @@ LAUNCHER_NAME = "codex_cdp.py"
 DESKTOP_LAUNCHER_NAME = "codex_cdp_desktop.pyw"
 COMMAND_NAME = "codex-cdp.cmd"
 DESKTOP_SHORTCUT_NAME = "Codex CDP.lnk"
+TRANSACTION_NAME = "install-transaction.json"
 TERMINAL_COMMAND = ("@echo off\r\n"
                     f'py -3 "%~dp0{LAUNCHER_NAME}" run %*\r\n'
                     "exit /b %ERRORLEVEL%\r\n").encode("ascii")
@@ -43,6 +45,52 @@ DESKTOP_QUERY = (
 
 class SetupError(RuntimeError):
     pass
+
+
+@contextmanager
+def _install_lock(directory: Path):
+    """Serialize recovery and mutations, including copies of this standalone script."""
+    identity = hashlib.sha256(os.path.normcase(str(directory.resolve())).encode("utf-8")).hexdigest()
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+        kernel.CreateMutexW.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+        kernel.ReleaseMutex.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.CreateMutexW(None, False, "Global\\CodexTokenSidebar.CDP." + identity)
+        if not handle:
+            raise SetupError("无法创建安装互斥锁")
+        acquired = False
+        try:
+            # WAIT_ABANDONED transfers ownership after a terminated installer.
+            result = kernel.WaitForSingleObject(handle, 30000)
+            if result not in (0, 0x80):
+                raise SetupError("另一个安装或卸载仍在运行，或无法取得安装锁；请稍后重试")
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel.ReleaseMutex(handle)
+            kernel.CloseHandle(handle)
+    else:
+        import fcntl
+
+        # Kept outside the removable install tree; unlinking a lock file can
+        # split waiters across different inodes. This branch supports OS-isolated tests.
+        lock_path = Path(tempfile.gettempdir()) / f"codex-cdp-{os.getuid()}-{identity}.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
 
 
 def _powershell() -> str:
@@ -239,16 +287,9 @@ def _load_state(path: Path) -> dict:
     return value
 
 
-def _write_owned(path: Path, content: bytes, state: dict, key: str) -> None:
-    if path.is_symlink():
+def _replace_bytes(path: Path, content: bytes) -> None:
+    if path.is_symlink() or path.parent.is_symlink():
         raise SetupError(f"拒绝覆盖链接：{path}")
-    if path.exists():
-        existing = _digest(path.read_bytes())
-        if existing != _digest(content) and state.get(key) != existing:
-            raise SetupError(f"已有非本工具管理的文件，未覆盖：{path}")
-        if existing == _digest(content):
-            state[key] = existing
-            return
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(prefix=".codex-cdp-", dir=path.parent,
                                      delete=False) as stream:
@@ -258,7 +299,6 @@ def _write_owned(path: Path, content: bytes, state: dict, key: str) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
-    state[key] = _digest(content)
 
 
 def pythonw_executable() -> Path:
@@ -286,38 +326,115 @@ def _create_shortcut(path: Path, launcher: Path, desktop_exe: Path) -> None:
         raise SetupError("无法在桌面创建 CDP 快捷方式")
 
 
-def _write_shortcut_owned(path: Path, launcher: Path, desktop_exe: Path, state: dict) -> None:
-    if path.is_symlink():
-        raise SetupError(f"拒绝覆盖链接：{path}")
-    if path.exists() and (state.get("desktop_shortcut_path") != str(path)
-                          or state.get("desktop_shortcut_sha256") != _digest(path.read_bytes())):
-        raise SetupError(f"已有非本工具管理的快捷方式，未覆盖：{path}")
+def _shortcut_bytes(path: Path, launcher: Path, desktop_exe: Path) -> bytes:
     with tempfile.NamedTemporaryFile(prefix=".codex-cdp-", suffix=".lnk",
                                      dir=path.parent, delete=False) as stream:
         temporary = Path(stream.name)
     temporary.unlink()
     try:
         _create_shortcut(temporary, launcher, desktop_exe)
-        digest = _digest(temporary.read_bytes())
-        temporary.replace(path)
+        return temporary.read_bytes()
     finally:
         temporary.unlink(missing_ok=True)
-    state["desktop_shortcut_path"] = str(path)
-    state["desktop_shortcut_sha256"] = digest
 
 
 def _save_state(path: Path, state: dict) -> None:
     content = (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    if path.is_symlink():
-        raise SetupError(f"拒绝覆盖链接：{path}")
-    with tempfile.NamedTemporaryFile(prefix=".codex-cdp-state-", dir=path.parent,
-                                     delete=False) as stream:
-        temporary = Path(stream.name)
-        stream.write(content)
+    _replace_bytes(path, content)
+
+
+def _user_path() -> str:
+    import winreg
+
     try:
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_QUERY_VALUE) as key:
+            value, _ = winreg.QueryValueEx(key, "Path")
+    except FileNotFoundError:
+        return ""
+    if not isinstance(value, str):
+        raise SetupError("用户 Path 注册表值不是字符串")
+    return value
+
+
+def _existing_bytes(path: Path) -> bytes | None:
+    if path.is_symlink() or path.parent.is_symlink() or (path.exists() and not path.is_file()):
+        raise SetupError(f"安装文件路径异常：{path}")
+    return path.read_bytes() if path.exists() else None
+
+
+def _recover_install(directory: Path) -> None:
+    with _install_lock(directory):
+        _recover_install_locked(directory)
+
+
+def _recover_install_locked(directory: Path) -> None:
+    """Roll back a prepared transaction; completed transactions only need cleanup."""
+    journal = directory / TRANSACTION_NAME
+    if not journal.exists() and not journal.is_symlink():
+        return
+    if journal.is_symlink() or directory.is_symlink() or directory.parent.is_symlink():
+        raise SetupError("安装事务路径是链接，未执行恢复")
+    transaction = _load_state(journal)
+    if (type(transaction.get("version")) is not int or transaction["version"] != 2
+            or transaction.get("phase") not in ("prepared", "committed")
+            or not isinstance(transaction.get("files"), list)):
+        raise SetupError("安装事务记录无效，未执行恢复")
+    _validate_path_change(transaction, directory)
+    allowed = {directory / name for name in (LAUNCHER_NAME, DESKTOP_LAUNCHER_NAME,
+                                             COMMAND_NAME, "setup-state.json")}
+    shortcut = transaction.get("shortcut")
+    if shortcut is not None:
+        expected = desktop_directory() / DESKTOP_SHORTCUT_NAME
+        if shortcut != str(expected):
+            raise SetupError("安装事务的桌面路径已变化，保留记录等待核对")
+        allowed.add(expected)
+    restores, seen = [], set()
+    for item in transaction["files"]:
+        try:
+            path = Path(item["path"])
+            if path not in allowed or path in seen:
+                raise ValueError("unexpected transaction path")
+            seen.add(path)
+            before = base64.b64decode(item["before"], validate=True) if item["before"] is not None else None
+            after = base64.b64decode(item["after"], validate=True)
+            if (item["beforeHash"] != (_digest(before) if before is not None else None)
+                    or item["afterHash"] != _digest(after)):
+                raise ValueError("transaction digest mismatch")
+        except (KeyError, TypeError, ValueError) as error:
+            raise SetupError("安装事务文件记录无效，未执行恢复") from error
+        current = _existing_bytes(path)
+        if current not in (before, after):
+            raise SetupError(f"安装事务中的文件已被其他操作修改，保留记录：{path}")
+        if transaction["phase"] == "committed" and current != after:
+            raise SetupError("已提交安装的文件不完整，保留事务记录")
+        restores.append((path, before, item["beforeHash"], item["afterHash"]))
+    if transaction["phase"] == "prepared":
+        _recover_user_path(directory, journal, transaction)
+        for path, before, before_hash, after_hash in reversed(restores):
+            # Preflight cannot establish ownership for a later mutation: an
+            # editor may have changed another asset while earlier ones restored.
+            current = _existing_bytes(path)
+            current_hash = _digest(current) if current is not None else None
+            if current_hash not in (before_hash, after_hash):
+                raise SetupError(f"安装事务中的文件已被其他操作修改，保留记录：{path}")
+            if current_hash == before_hash:
+                continue
+            if before is None:
+                path.unlink()
+            else:
+                _replace_bytes(path, before)
+    journal.unlink()
+    if not any(directory.iterdir()):
+        directory.rmdir()
+
+
+def _transaction_file(path: Path, content: bytes, expected: str | None) -> dict:
+    before = _existing_bytes(path)
+    if before is not None and _digest(before) not in (expected, _digest(content)):
+        raise SetupError(f"已有非本工具管理的文件，未覆盖：{path}")
+    return {"path": str(path), "before": base64.b64encode(before).decode("ascii") if before is not None else None,
+            "beforeHash": _digest(before) if before is not None else None,
+            "after": base64.b64encode(content).decode("ascii"), "afterHash": _digest(content)}
 
 
 def path_with_entry(existing: str, entry: Path) -> str:
@@ -326,6 +443,69 @@ def path_with_entry(existing: str, entry: Path) -> str:
         if item and ntpath.normcase(ntpath.normpath(os.path.expandvars(item.strip('"')))) == normalized:
             return existing
     return existing + ("" if not existing or existing.endswith(";") else ";") + str(entry)
+
+
+def _validate_path_change(transaction: dict, directory: Path) -> None:
+    change = transaction.get("pathChange")
+    if change is None and "pathChange" in transaction:
+        return
+    if (not isinstance(change, dict)
+            or change.get("stage") not in ("not_started", "writing", "completed", "reverting", "reverted")
+            or not isinstance(change.get("before"), str)
+            or not isinstance(change.get("after"), str)
+            or path_with_entry(change["before"], directory) != change["after"]
+            or (change["stage"] != "not_started" and type(change.get("kind")) is not int)):
+        raise SetupError("安装事务的 Path 记录无效，保留记录")
+    if change["stage"] == "reverting":
+        before, after = change.get("restoreBefore"), change.get("restoreAfter")
+        if (not isinstance(before, str) or not isinstance(after, str)
+                or change["before"] == change["after"]
+                or not before.startswith(change["after"])
+                or (before[len(change["after"]):] and not before[len(change["after"]):].startswith(";"))
+                or after != change["before"] + before[len(change["after"]):]):
+            raise SetupError("安装事务的 Path 恢复记录无效，保留记录")
+
+
+def _replace_user_path(expected: str, updated: str, kind: int) -> None:
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                        winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE) as key:
+        current, current_kind = winreg.QueryValueEx(key, "Path")
+        if current != expected or current_kind != kind:
+            raise SetupError("用户 Path 在恢复前被修改，保留事务记录")
+        winreg.SetValueEx(key, "Path", 0, kind, updated)
+
+
+def _recover_user_path(directory: Path, journal: Path, transaction: dict) -> None:
+    change = transaction["pathChange"]
+    if change is None or change["stage"] in ("not_started", "reverted"):
+        return
+    before, after = change["before"], change["after"]
+    if before == after:
+        return
+    current = _user_path()
+    if change["stage"] == "writing":
+        # A crash between SetValueEx and recording completion is ambiguous;
+        # an identical value alone does not prove who added the entry.
+        if current == before:
+            return
+        raise SetupError("无法确认 Path 写入是否完成，保留事务记录等待核对")
+    if change["stage"] == "reverting":
+        if current != change["restoreAfter"]:
+            raise SetupError("无法确认 Path 撤回是否完成，保留事务记录等待核对")
+    elif current != before and path_with_entry(current, directory) == current:
+        # Only an intact recorded prefix proves the position of our appended
+        # entry. Later appended entries, including duplicates, stay untouched.
+        suffix = current[len(after):]
+        if not current.startswith(after) or (suffix and not suffix.startswith(";")):
+            raise SetupError("用户 Path 已被其他操作修改，无法确认归属，保留事务记录")
+        change.update(stage="reverting", restoreBefore=current, restoreAfter=before + suffix)
+        _save_state(journal, transaction)
+        _replace_user_path(current, change["restoreAfter"], change["kind"])
+    change["stage"] = "reverted"
+    _save_state(journal, transaction)
+    _broadcast_environment()
 
 
 def _broadcast_environment() -> bool:
@@ -342,7 +522,7 @@ def _broadcast_environment() -> bool:
                      ctypes.byref(result)))
 
 
-def add_user_path(entry: Path) -> bool:
+def add_user_path(entry: Path, transaction: dict) -> bool:
     import winreg
 
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, "Environment", 0,
@@ -354,40 +534,99 @@ def add_user_path(entry: Path) -> bool:
         if not isinstance(current, str):
             raise SetupError("用户 Path 注册表值不是字符串")
         updated = path_with_entry(current, entry)
+        change = transaction["pathChange"]
+        change.update(before=current, after=updated, kind=kind)
         if updated == current:
+            change["stage"] = "completed"
+            _save_state(entry / TRANSACTION_NAME, transaction)
             return True
+        change["stage"] = "writing"
+        _save_state(entry / TRANSACTION_NAME, transaction)
+        try:
+            latest, latest_kind = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            latest, latest_kind = "", winreg.REG_EXPAND_SZ
+        if latest != current or latest_kind != kind:
+            raise SetupError("用户 Path 在写入前被修改，保留事务记录")
         winreg.SetValueEx(key, "Path", 0, kind, updated)
+        change["stage"] = "completed"
+        _save_state(entry / TRANSACTION_NAME, transaction)
     return _broadcast_environment()
 
 
 def install(mode: str) -> Path:
-    desktop_exe = desktop_executable(package_directory())
     directory = support_directory()
+    with _install_lock(directory):
+        return _install_locked(directory, mode)
+
+
+def _install_locked(directory: Path, mode: str) -> Path:
+    if directory.is_symlink() or directory.parent.is_symlink():
+        raise SetupError("插件运行目录是链接，未执行安装")
+    _recover_install_locked(directory)
+    desktop_exe = desktop_executable(package_directory())
     directory.mkdir(parents=True, exist_ok=True)
     state_path = directory / "setup-state.json"
-    state = _load_state(state_path)
-    source = Path(__file__).resolve().read_bytes()
-    launcher = directory / LAUNCHER_NAME
+    journal = directory / TRANSACTION_NAME
+    try:
+        state = _load_state(state_path)
+        files = []
 
-    if mode == "app":
-        desktop_source = Path(__file__).with_name(DESKTOP_LAUNCHER_NAME)
-        if not desktop_source.is_file():
-            raise SetupError(f"缺少桌面启动脚本：{desktop_source}")
-        desktop_launcher = directory / DESKTOP_LAUNCHER_NAME
-        output = desktop_directory() / DESKTOP_SHORTCUT_NAME
-        _write_owned(launcher, source, state, "launcher_sha256")
-        _write_owned(desktop_launcher, desktop_source.read_bytes(), state, "desktop_launcher_sha256")
-        _write_shortcut_owned(output, desktop_launcher, desktop_exe, state)
-    else:
-        _write_owned(launcher, source, state, "launcher_sha256")
-        _write_owned(directory / COMMAND_NAME, TERMINAL_COMMAND, state, "command_sha256")
-        path_updated = add_user_path(directory)
-        state["terminal_path"] = str(directory)
-        if not path_updated:
+        def prepare(path, content, key):
+            files.append(_transaction_file(path, content, state.get(key)))
+            state[key] = _digest(content)
+
+        prepare(directory / LAUNCHER_NAME, Path(__file__).resolve().read_bytes(), "launcher_sha256")
+        if mode == "app":
+            desktop_source = Path(__file__).with_name(DESKTOP_LAUNCHER_NAME)
+            if not desktop_source.is_file():
+                raise SetupError(f"缺少桌面启动脚本：{desktop_source}")
+            desktop_launcher = directory / DESKTOP_LAUNCHER_NAME
+            output = desktop_directory() / DESKTOP_SHORTCUT_NAME
+            existing = _existing_bytes(output)
+            if existing is not None and (state.get("desktop_shortcut_path") != str(output)
+                    or state.get("desktop_shortcut_sha256") != _digest(existing)):
+                raise SetupError(f"已有非本工具管理的快捷方式，未覆盖：{output}")
+            prepare(desktop_launcher, desktop_source.read_bytes(), "desktop_launcher_sha256")
+            prepare(output, _shortcut_bytes(output, desktop_launcher, desktop_exe), "desktop_shortcut_sha256")
+            state["desktop_shortcut_path"] = str(output)
+            path_change = None
+        else:
+            output = directory / COMMAND_NAME
+            prepare(output, TERMINAL_COMMAND, "command_sha256")
+            current_path = _user_path()
+            path_change = {"stage": "not_started", "before": current_path,
+                           "after": path_with_entry(current_path, directory)}
+            state["terminal_path"] = str(directory)
+        state_bytes = (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        previous_state = _existing_bytes(state_path)
+        files.append(_transaction_file(state_path, state_bytes,
+                     _digest(previous_state) if previous_state is not None else None))
+        transaction = {"version": 2, "phase": "prepared", "files": files,
+                       "pathChange": path_change, "shortcut": str(output) if mode == "app" else None}
+        # Every preimage and intended value is durable before the first asset
+        # changes, so another installer process can recover after termination.
+        _save_state(journal, transaction)
+        for item in files[:-1]:
+            path = Path(item["path"])
+            current = _existing_bytes(path)
+            if (_digest(current) if current is not None else None) != item["beforeHash"]:
+                raise SetupError(f"文件在安装准备后被修改：{path}")
+            _replace_bytes(path, base64.b64decode(item["after"]))
+        if mode != "app" and not add_user_path(directory, transaction):
             print("用户 Path 已更新；若新终端尚未识别 codex-cdp，请重新登录 Windows。", file=sys.stderr)
-        output = directory / COMMAND_NAME
-    _save_state(state_path, state)
-    return output
+        if _existing_bytes(state_path) != previous_state:
+            raise SetupError("安装记录在提交前被修改")
+        _save_state(state_path, state)
+        transaction["phase"] = "committed"
+        _save_state(journal, transaction)
+        _recover_install_locked(directory)
+        return output
+    except Exception:
+        _recover_install_locked(directory)
+        if directory.exists() and not any(directory.iterdir()):
+            directory.rmdir()
+        raise
 
 
 def remove_user_path(entry: Path) -> None:
@@ -418,11 +657,17 @@ def remove_user_path(entry: Path) -> None:
 def uninstall() -> list[Path]:
     """Remove recorded CDP entries from the same external environment as installation."""
     directory = support_directory()
+    with _install_lock(directory):
+        return _uninstall_locked(directory)
+
+
+def _uninstall_locked(directory: Path) -> list[Path]:
     runtime_directory = directory.parent
     state_path = directory / "setup-state.json"
     current_shortcut = desktop_directory() / DESKTOP_SHORTCUT_NAME
     if runtime_directory.is_symlink() or directory.is_symlink() or state_path.is_symlink():
         raise SetupError("插件运行目录或安装状态文件是链接，未执行清理")
+    _recover_install_locked(directory)
     if not state_path.exists():
         if current_shortcut.exists() or current_shortcut.is_symlink() or directory.exists():
             raise SetupError("缺少 CDP 安装记录，无法确认现有文件归属；未清理，请交给 Agent 核对")

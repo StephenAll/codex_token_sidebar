@@ -4,6 +4,24 @@ from copy import deepcopy
 from decimal import Decimal, localcontext
 
 
+def merge_credit_sources(records):
+    """Combine same-response evidence without borrowing a copied thread's context."""
+    records = list(records)
+    if not records:
+        return None
+    candidates = [record for record in records if record.get('metadataOwned')] or records
+    result = deepcopy(candidates[-1])
+    for field, conflict in (('provider', None), ('model', 'modelAmbiguous'),
+                            ('serviceTier', 'tierAmbiguous')):
+        values = {record[field] for record in candidates if isinstance(record.get(field), str) and record[field]}
+        ambiguous = len(values) > 1 or (conflict and any(record.get(conflict) for record in candidates))
+        result[field] = next(iter(values)) if len(values) == 1 and not ambiguous else None
+        if conflict:
+            result[conflict] = bool(ambiguous)
+    result['hasResponseIdentity'] = any(record.get('hasResponseIdentity') for record in candidates)
+    return result
+
+
 def quote(record, card):
     if not record.get('hasResponseIdentity'):
         return None, 'missing_response_identity'
@@ -19,8 +37,9 @@ def quote(record, card):
     tier = card['tierAliases'].get(record.get('serviceTier'))
     if tier is None:
         return None, 'unknown_service_tier'
-    if tier == 'fast' and not rates.get('fastMultiplier'):
-        return None, 'unknown_fast_rate'
+    multiplier = rates.get(tier + 'Multiplier') if tier in ('fast', 'ultrafast') else '1'
+    if multiplier is None:
+        return None, 'unknown_' + tier + '_rate'
     usage = record.get('usage')
     if not isinstance(usage, dict):
         return None, 'invalid_or_missing_usage'
@@ -44,7 +63,7 @@ def quote(record, card):
         context.prec = 80
         amount = (Decimal(inp-cached)*Decimal(rates['input']) + Decimal(cached)*Decimal(rates['cachedInput'])
                   + Decimal(out)*Decimal(rates['output'])) / Decimal(1_000_000)
-        return amount * (Decimal(rates['fastMultiplier']) if tier == 'fast' else 1), None
+        return amount * Decimal(multiplier), None
 
 
 class CreditsLedger:

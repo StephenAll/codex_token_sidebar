@@ -250,7 +250,9 @@ class Instance:
                     token = value.get("token")
                     if (type(value.get("protocol")) is not int or value["protocol"] != PROTOCOL
                             or not isinstance(action, str) or action not in ("status", "stop")
-                            or not isinstance(token, str) or not hmac.compare_digest(token, self.token)):
+                            or not isinstance(token, str) or len(token) != 64
+                            or any(char not in "0123456789abcdef" for char in token)
+                            or not hmac.compare_digest(token, self.token)):
                         raise LifecycleError("Unsupported control request")
                     with self.snapshot_lock:
                         details = deepcopy(self.details)

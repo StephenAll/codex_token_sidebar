@@ -12,9 +12,9 @@ import time
 from typing import Any, Callable
 
 from usage import (
-    FEATURE_TASKS, UsageStream, UsageAccumulator,
+    UsageStream, UsageByThread, summarize_coverage, merge_usage_sources,
 )
-from credits import CreditsLedger
+from credits import CreditsLedger, merge_credit_sources
 from rate_sync import bundled_card
 import rollout_discovery
 from rollout_discovery import DiscoveryResult, RolloutCatalog, _session_id_from_path, _signature as _file_signature
@@ -24,8 +24,8 @@ LOGGER = logging.getLogger("codex-token-sidebar")
 class _RolloutState:
     """Byte cursor and bounded boundary samples; retains no complete message text."""
 
-    def __init__(self, session_id: str, audit_after: float):
-        self.parser = UsageStream(session_id)
+    def __init__(self, session_id: str, audit_after: float, *, source_id=None):
+        self.parser = UsageStream(session_id, source_id=source_id)
         self.signature: tuple[int, ...] = ()
         self.offset = 0
         self.pending = b""
@@ -76,7 +76,8 @@ class UsageReader:
         self.rate_source = rate_source
         self._rate_status = "bundled"
         self._contributors: tuple[dict, dict] = ({}, {})
-        self._totals = (UsageAccumulator(modern=True), UsageAccumulator(modern=False))
+        self._proof_mismatches: dict[str, set] = {}
+        self._totals = (UsageByThread(modern=True), UsageByThread(modern=False))
         self._discoverer = discoverer or RolloutCatalog(
             self.sessions_dir, clock=clock, discovery_interval=discovery_interval)
         self._discovery_state: tuple | None = None
@@ -122,8 +123,20 @@ class UsageReader:
                     bucket.pop(path, None)
                 else:
                     bucket[path] = value
-                # Match the batch reader's sorted-path, last-file-wins policy.
-                totals.set(key, bucket[max(bucket, key=Path)] if bucket else None)
+                # Original execution metadata outranks inherited copies. Within
+                # the same ownership class retain deterministic path precedence.
+                values = [bucket[name] for name in sorted(bucket, key=Path)]
+                winner = merge_usage_sources(values) if totals.modern else (values[-1] if values else None)
+                totals.set(key, winner)
+                if totals.modern:
+                    self._proof_mismatches.setdefault(path, set()).discard(key)
+                    for source, candidate in bucket.items():
+                        invalid = self._proof_mismatches.setdefault(source, set())
+                        if (candidate.metadata_owned
+                                and candidate.coverage_identity() != winner.coverage_identity()):
+                            invalid.add(key)
+                        else:
+                            invalid.discard(key)
                 if not bucket:
                     sources.pop(key, None)
 
@@ -132,7 +145,7 @@ class UsageReader:
             bucket = self._credit_sources.setdefault(key, {})
             if value is None: bucket.pop(path, None)
             else: bucket[path] = value
-            self._credits.set(key, bucket[max(bucket, key=Path)] if bucket else None)
+            self._credits.set(key, merge_credit_sources(bucket[name] for name in sorted(bucket, key=Path)))
             if not bucket: self._credit_sources.pop(key, None)
 
     def set_rate_card(self, card):
@@ -147,6 +160,7 @@ class UsageReader:
             self._apply_credits(path, {key: None for key in state.parser.credits.records})
             self._apply_changes(path, ({key: None for key in state.parser.records},
                                        {key: None for key in state.parser.events}))
+        self._proof_mismatches.pop(path, None)
 
     def _refresh_file(self, path: Path, expected: tuple[int, ...]) -> None:
         key = str(path)
@@ -198,7 +212,7 @@ class UsageReader:
                     or self._signature(path) != expected):
                 raise OSError("Rollout changed during read")
         if reset:
-            replacement = _RolloutState(_session_id_from_path(path), now + self._audit_interval)
+            replacement = _RolloutState(_session_id_from_path(path), now + self._audit_interval, source_id=key)
             replacement.consume(data)
             self._drop_file(key)
             state = replacement
@@ -256,34 +270,36 @@ class UsageReader:
             self.read_status = 'deferred' if self._snapshot['status'] == 'ok' else 'failed'
             return deepcopy(self._snapshot)
         modern, legacy = self._totals
-        if modern.items:
-            summary = modern.report()
-            by_feature = summary["by_feature"]
-            request_count, turn_count = summary["request_count"], summary["turn_count"]
-            event_count = 0
-        else:
-            summary = legacy.report()
-            by_feature = ([{"feature": FEATURE_TASKS, **summary["total"], "share": 100.0}]
-                          if legacy.items else [])
-            request_count = turn_count = None
-            event_count = len(legacy.items)
+        coverage = {}
+        for path, state in self._states.items():
+            evidence = state.parser.coverage
+            if state.parser.events:
+                coverage[evidence.execution_id] = (coverage.get(evidence.execution_id, True)
+                    and evidence.covered and not self._proof_mismatches.get(path))
+        summary = summarize_coverage(modern, legacy, covered_threads={thread for thread, complete in coverage.items() if complete})
+        summary["usage_limits"].update(set().union(*(state.parser.usage_limitations
+                                                   for state in self._states.values())))
         limitations = set().union(*(state.parser.credits.limitations for state in self._states.values()))
-        if (modern.items or legacy.items) and not self._credits.records:
+        limitations.update(summary["credit_limits"])
+        if (modern.threads or legacy.threads) and not self._credits.records:
             limitations.add('missing_response_records')
         if self._read_failed: limitations.add('read_incomplete')
         credit_report = self._credits.report(limitations)
         credit_report['rateStatus'] = self._rate_status
         credit_report['rateVerifiedOn'] = self._credits.card.get('verifiedOn')
         payload = {
-            "status": "ok" if session_id and (modern.items or legacy.items) else "waiting",
+            "status": "ok" if session_id and (modern.threads or legacy.threads) else "waiting",
             "conversationId": session_id,
             "session": summary["total"],
             "sessionCredits": credit_report,
-            "sessionByFeature": by_feature,
+            "sessionUsageCompleteness": {
+                "status": "partial" if summary["usage_limits"] else "complete",
+                "reasons": sorted(summary["usage_limits"])},
+            "sessionByFeature": summary["by_feature"],
             "sessionByModel": summary["by_model"],
-            "sessionEventCount": event_count,
-            "sessionRequestCount": request_count,
-            "sessionTurnCount": turn_count,
+            "sessionEventCount": summary["event_count"],
+            "sessionRequestCount": summary["request_count"],
+            "sessionTurnCount": summary["turn_count"],
         }
         payload["revision"] = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

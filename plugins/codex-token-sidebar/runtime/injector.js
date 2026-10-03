@@ -110,15 +110,27 @@
     }
   }
 
+  function isVisibleHost(node) {
+    if (!node || !node.isConnected) return false;
+    // Retained task trees can stay connected while hidden or inactive.
+    for (var parent = node; parent; parent = parent.parentElement) {
+      if (parent.hidden || parent.inert || parent.getAttribute("aria-hidden") === "true") return false;
+    }
+    return node.checkVisibility
+      ? node.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+      : node.getClientRects().length > 0 && window.getComputedStyle(node).visibility === "visible";
+  }
+
   function findScroller() {
-    if (cachedScroller && cachedScroller.isConnected) return cachedScroller;
+    if (isVisibleHost(cachedScroller)) return cachedScroller;
+    cachedScroller = null;
     var buttons = document.querySelectorAll(
       'section header button[class~="group/section-toggle"],' +
         'section header button[class*="section-toggle"]'
     );
     for (var i = 0; i < buttons.length; i++) {
       var section = buttons[i].closest("section");
-      if (section && section.parentElement) {
+      if (section && isVisibleHost(buttons[i]) && isVisibleHost(section.parentElement)) {
         cachedScroller = section.parentElement;
         return cachedScroller;
       }
@@ -126,19 +138,55 @@
     return null;
   }
 
-  function fiberConversationId(start) {
-    if (!start) return null;
-    var fiberKey = null;
-    for (var key in start) {
+  function domFiber(node) {
+    if (!node || !node.isConnected) return null;
+    for (var key in node) {
       if (key.indexOf("__reactFiber$") === 0) {
-        fiberKey = key;
-        break;
+        return node[key];
       }
     }
-    if (!fiberKey) return null;
-    var fiber = start[fiberKey];
-    var depth = 0;
-    while (fiber && depth < 50) {
+    return null;
+  }
+
+  function currentFiberPath(start, cache) {
+    if (!start || typeof start !== "object") return null;
+    var pending = [], seen = new Set(), cursor = start, path = null;
+    while (cursor && typeof cursor === "object" && pending.length < 100) {
+      if (cache.has(cursor)) { path = cache.get(cursor); break; }
+      if (seen.has(cursor)) return null;
+      seen.add(cursor);
+      if (!cursor.return) {
+        var current = cursor.stateNode && cursor.stateNode.current;
+        if (!current || (current !== cursor && current !== cursor.alternate)) return null;
+        path = [current];
+        break;
+      }
+      pending.push(cursor);
+      cursor = cursor.return;
+    }
+    if (!path) return null;
+    // Walk down from the committed root using actual child membership. A
+    // shared bailout subtree may retain old return pointers, so an upward
+    // return chain alone cannot determine which branch is currently visible.
+    var budget = 4000;
+    for (var i = pending.length - 1; i >= 0; i--) {
+      var original = pending[i], child = path[0].child;
+      while (child && child !== original && child !== original.alternate && --budget > 0) {
+        child = child.sibling;
+      }
+      if (!child || budget <= 0) return null;
+      path = [child].concat(path);
+      cache.set(original, path);
+      if (original.alternate) cache.set(original.alternate, path);
+    }
+    return path;
+  }
+
+  function fiberConversationId(start, cache) {
+    var path = currentFiberPath(domFiber(start), cache);
+    if (!path) return null;
+    for (var depth = 0; depth < path.length; depth++) {
+      var fiber = path[depth];
       var bags = [fiber.memoizedProps, fiber.memoizedState];
       for (var b = 0; b < bags.length; b++) {
         var bag = bags[b];
@@ -155,15 +203,13 @@
           }
         }
       }
-      fiber = fiber.return;
-      depth++;
     }
     return null;
   }
 
   function resolveConversationId() {
-    if (!contextAnchor || !contextAnchor.isConnected) {
-      contextAnchor = document.querySelector('[aria-label^="Context usage:"]');
+    if (!isVisibleHost(contextAnchor)) {
+      contextAnchor = Array.from(document.querySelectorAll('[aria-label^="Context usage:"]')).find(isVisibleHost) || null;
     }
     var root = document.getElementById(ROOT_ID);
     var anchors = [
@@ -171,15 +217,17 @@
       findScroller(),
       root && root.previousElementSibling,
     ];
+    var cache = new WeakMap(), identities = new Set();
     for (var i = 0; i < anchors.length; i++) {
-      var id = fiberConversationId(anchors[i]);
-      if (id) return id;
+      if (!isVisibleHost(anchors[i])) continue;
+      var id = fiberConversationId(anchors[i], cache);
+      if (id) identities.add(id);
     }
-    return null;
+    return identities.size === 1 ? identities.values().next().value : null;
   }
 
   function readConversationId() {
-    var current = resolveConversationId();
+    var current = hostAdapter.conversationId();
     if (current !== lastConversationId) {
       lastConversationId = current;
       selectionEpoch++;
@@ -237,19 +285,15 @@
     reroutesDirty = false;
     lastRouteScanId = conversationId;
     var seenFibers = new WeakSet();
+    var cache = new WeakMap();
     var nodes = root.querySelectorAll("*");
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
-      var fiber = null;
-      for (var key in node) {
-        if (key.indexOf("__reactFiber$") === 0) {
-          fiber = node[key];
-          break;
-        }
-      }
-      var depth = 0;
-      while (fiber && typeof fiber === "object" && depth++ < 80
-          && !seenFibers.has(fiber)) {
+      var path = currentFiberPath(domFiber(node), cache);
+      if (!path) continue;
+      for (var depth = 0; depth < path.length; depth++) {
+        var fiber = path[depth];
+        if (seenFibers.has(fiber)) break;
         seenFibers.add(fiber);
         var props = fiber.memoizedProps;
         if (props && props.conversationId === conversationId
@@ -261,7 +305,6 @@
             }
           }
         }
-        fiber = fiber.return;
       }
     }
   }
@@ -282,7 +325,7 @@
     var key = "history-content:turn:" + turnId;
     var nodes = root.querySelectorAll("[data-turn-key]");
     for (var i = 0; i < nodes.length; i++) {
-      if (nodes[i].getAttribute("data-turn-key") === key && nodes[i].isConnected) {
+      if (nodes[i].getAttribute("data-turn-key") === key && isVisibleHost(nodes[i])) {
         return nodes[i];
       }
     }
@@ -294,7 +337,7 @@
     var style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-#codex-token-sidebar{--cts-muted:var(--color-token-text-secondary,#b7b7bf);--cts-rule:rgba(128,128,128,.2);display:block;container-type:inline-size;padding:0 0 12px;user-select:none;color:var(--color-token-text-primary,#ededed);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums}
+#codex-token-sidebar{--cts-muted:var(--color-token-text-secondary,currentColor);--cts-rule:rgba(128,128,128,.2);display:block;container-type:inline-size;padding:0 0 12px;user-select:none;color:var(--color-token-text-primary,inherit);font-size:12px;line-height:1.5;font-variant-numeric:tabular-nums}
 #codex-token-sidebar *{box-sizing:border-box}
 #codex-token-sidebar .cts-header{display:flex;align-items:center;height:30px;padding:0 16px;background:var(--color-token-dropdown-background,transparent)}
 #codex-token-sidebar .cts-toggle{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;color:var(--cts-muted);font-size:14px;cursor:pointer;padding:2px 0}
@@ -340,7 +383,7 @@
 #codex-token-sidebar .cts-dot{width:8px;height:8px;border-radius:50%;background:var(--cts-color);flex:none}
 #codex-token-sidebar .cts-amount,#codex-token-sidebar .cts-share{text-align:right;white-space:nowrap;font-size:12px}
 #codex-token-sidebar .cts-amount{font-weight:550}
-#codex-token-sidebar .cts-share{color:#fff}
+#codex-token-sidebar .cts-share{color:inherit}
 #codex-token-sidebar .cts-bar{display:flex;height:6px;border-radius:4px;overflow:hidden;background:rgba(128,128,128,.25)}
 #codex-token-sidebar .cts-feature-bar{height:10px}
 #codex-token-sidebar .cts-bar-segment{height:100%;background:var(--cts-color);flex:none}
@@ -361,7 +404,7 @@
 #codex-token-sidebar .cts-model-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:28px;row-gap:4px}
 #codex-token-sidebar .cts-model-detail{display:flex;align-items:baseline;justify-content:space-between;gap:6px;min-width:0;font-size:12px}
 #codex-token-sidebar .cts-model-detail-label{color:var(--cts-muted);white-space:nowrap}
-#codex-token-sidebar .cts-model-detail-value{color:#fff;white-space:nowrap}
+#codex-token-sidebar .cts-model-detail-value{color:inherit;white-space:nowrap}
 #codex-token-sidebar .cts-muted{color:var(--cts-muted);font-size:12px}
 @container (max-width:360px){
 #codex-token-sidebar .cts-model-details{column-gap:18px}
@@ -435,8 +478,8 @@
   function formatCredits(value) {
     var amount = value == null ? NaN : Number(value);
     if (!Number.isFinite(amount) || amount < 0) return "—";
-    if (amount > 0 && amount < 0.01) return "<0.01";
-    return amount.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    if (amount > 0 && amount < 0.1) return "<0.1";
+    return amount.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
   }
 
   function statsGrid(rows) {
@@ -579,7 +622,7 @@
       card.appendChild(status);
       card.addEventListener("click", function () {
         if (readConversationId() !== conversationId) return;
-        var anchor = findNativeTurnAnchor(item.turnId);
+        var anchor = hostAdapter.turnAnchor(item.turnId);
         if (!anchor) {
           status.textContent = "未加载";
           card.title = "目标轮次尚未加载";
@@ -646,7 +689,13 @@
     }
 
     var totalLine = text("div", "cts-total");
-    totalLine.appendChild(summaryMetric("当前会话", data.session.total_tokens, true));
+    var sessionMetric = summaryMetric("当前会话", data.session.total_tokens, true);
+    if (data.sessionUsageCompleteness && data.sessionUsageCompleteness.status === "partial") {
+      var usageStatus = text("div", "cts-muted cts-usage-status", "用量可能不完整");
+      usageStatus.setAttribute("role", "status");
+      sessionMetric.appendChild(usageStatus);
+    }
+    totalLine.appendChild(sessionMetric);
     var credits = data.sessionCredits;
     var creditRow = text("div", "cts-credits");
     creditRow.appendChild(text("span", "cts-summary-label", "参考 Credits"));
@@ -687,18 +736,19 @@
 
   function ensureNode() {
     if (disposed) return null;
-    if (!isMainPage() || !hasMainShell()) {
+    if (!hostAdapter.isMainPage() || !hostAdapter.hasShell()) {
       observer.disconnect();
       observedScroller = observedParent = null;
       if (panel) panel.remove();
       return null;
     }
     ensureStyle();
-    var scroller = findScroller();
+    var scroller = hostAdapter.scroller();
     if (!scroller) {
       observer.disconnect();
       observedScroller = null;
       observedParent = null;
+      if (panel) panel.remove();
       return null;
     }
     var node = panel || document.getElementById(ROOT_ID);
@@ -743,17 +793,24 @@
     return node;
   }
 
+  // All host-private selectors and React navigation stay behind this adapter.
+  var hostAdapter = {
+    isMainPage: isMainPage, hasShell: hasMainShell, scroller: findScroller,
+    conversationId: resolveConversationId, scanReroutes: scanNativeReroutes,
+    turnAnchor: findNativeTurnAnchor,
+  };
+
   window.__codexTokenSidebarUpdate = function (data) {
     if (disposed || !data || data.schemaVersion !== SCHEMA_VERSION
         || typeof data.revision !== "string" || !Number.isSafeInteger(data.probeId)) {
       return { status: "needs_install" };
     }
-    if (!isMainPage() || !hasMainShell() || data.pageUrl !== window.location.href) {
+    if (!hostAdapter.isMainPage() || !hostAdapter.hasShell() || data.pageUrl !== window.location.href) {
       ensureNode();
       return { status: "stale" };
     }
     var activeId = readConversationId();
-    scanNativeReroutes(activeId);
+    hostAdapter.scanReroutes(activeId);
     if (data.pageEpoch !== pageEpoch || data.selectionEpoch !== selectionEpoch
         || data.conversationId !== activeId || data.probeId !== probeId
         || data.probeId < acceptedProbeId
@@ -779,14 +836,14 @@
     if (disposed) return null;
     receiveHeartbeat(health);
     var activeId = readConversationId();
-    scanNativeReroutes(activeId);
+    hostAdapter.scanReroutes(activeId);
     var mounted = !!ensureNode();
     var data = window.__codexTokenSidebarData;
     return {
       schemaVersion: SCHEMA_VERSION,
       pageUrl: window.location.href,
       mounted: mounted,
-      targetRecognized: hasMainShell(),
+      targetRecognized: hostAdapter.hasShell(),
       scriptHash: scriptHash,
       pageEpoch: pageEpoch,
       conversationId: activeId,

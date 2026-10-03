@@ -32,6 +32,8 @@ Codex Token Sidebar 是面向 macOS 和 Windows 版 Codex Desktop 的 Token 用�
 
 安装后，打开一个已有用量的任务，在固定摘要侧栏展开“Token 用量”，即可查看该任务的统计。
 
+参考 Credits 使用当前公开的购买 Credits 费率估算，不等同于套餐内额度扣减或历史账单。Fast 与 Ultrafast 使用各自公布的 Credits 倍率；没有明确模型或速度费率的用量保留为未计价。费率和适用范围见[官方定价](https://learn.chatgpt.com/docs/pricing)及[速度说明](https://learn.chatgpt.com/docs/agent-configuration/speed)。
+
 ## 数据留在本机
 
 会话用量在本机读取和汇总。插件更新公开费率时，不会上传会话内容、账号凭据或用量明细。

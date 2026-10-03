@@ -2,7 +2,7 @@
 
 只在安装验收失败，或用户要求排障、更新、回退、卸载时读取本文件。首次安装从 [INSTALL.md](../INSTALL.md) 进入对应平台路线。以下命令都从包含 `.agents/plugins/marketplace.json` 的项目根目录运行；按 **Codex Desktop 的宿主系统** 选择 macOS 或 Windows，不以 WSL 内的系统信息判断。
 
-先确认本次目标，只执行对应章节。执行后向用户说明已完成的操作、验收结果和仍未解决的问题。macOS 示例 CLI 路径为 `/Applications/ChatGPT.app/Contents/Resources/codex`，应用不在该位置时先找到实际路径；Windows 的 `$codexExe` 每次都按 [Windows 安装路线](windows.md)第 1 步重新确定。
+先确认本次目标，只执行对应章节。执行后向用户说明已完成的操作、验收结果和仍未解决的问题。macOS 示例 CLI 路径为 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`，应用不在该位置时先找到实际路径；Windows 的 `$codexExe` 每次都按 [Windows 安装路线](windows.md)第 1 步重新确定。
 
 ## 排障：面板没有出现
 
@@ -32,7 +32,7 @@
 4. 若 `stephen` 市场尚未指向目标版本的项目目录，用 Desktop CLI 执行 `plugin marketplace remove stephen`，再从目标项目根目录执行 `plugin marketplace add .`；若已指向目标目录则保持不动。然后用同一个 CLI 重新安装插件；本地市场重复执行 `plugin add` 会刷新安装缓存。记录返回的安装路径：
 
    ```sh
-   /Applications/ChatGPT.app/Contents/Resources/codex plugin add codex-token-sidebar@stephen --json
+   /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex plugin add codex-token-sidebar@stephen --json
    ```
 
    Windows 原生 PowerShell 改用：
@@ -47,6 +47,10 @@
 
 仅在更新失败，或用户明确要求恢复旧版时执行。
 
+Windows CDP 入口安装中断时，`%LOCALAPPDATA%\Codex Token Sidebar\CDP\install-transaction.json` 保存恢复证据。使用支持事务恢复的 `scripts/setup_windows_cdp.py` 再次执行原来的 `app`、`terminal` 或 `uninstall` 操作，会先恢复未完成的安装；成功提交的事务只清理记录。安装、卸载和恢复共用按安装目录命名的 Windows mutex，复制后的独立脚本也遵守同一互斥；等待超过 30 秒会提示稍后重试，持锁进程退出后可继续恢复。
+
+恢复会在每个文件替换或删除前复验指纹。Path 事务记录未开始、写入中、完成以及撤回进度和对应前后值：未开始时不操作 Path；已完成的添加只撤回可核实位置上的本次新增项，并保留后续追加项。若写入中断后无法确认归属、文件被外部修改或桌面路径变化，会保留事务记录和现场，停止自动恢复。此时核对日志中的文件内容、指纹及 Path 前后值，再决定如何处理现场；不要直接删除日志来跳过检查。能够核实归属的安装失败会自动撤回本次修改，恢复原版本。
+
 1. 用对应平台的控制命令停止当前运行实例，确认 `status=stopped`。从仓库外的备份恢复旧版**项目源码**，核对插件清单、市场清单和此前记录的版本与指纹；不要直接覆盖 Codex 管理的安装缓存。
 2. 若 `stephen` 市场尚未指向旧版项目目录，用 Desktop CLI 执行 `plugin marketplace remove stephen`，再从旧版项目根目录执行 `plugin marketplace add .`；不要移除其他市场。随后用上述平台的 `plugin add codex-token-sidebar@stephen --json` 重新安装，并记录安装路径。
 3. 请用户新建任务；必要时按安装路线处理 Hook 信任提示。用旧版源码身份、安装路径、运行状态、健康状态和可见面板完成验收。回退仍失败时保留备份与诊断结果，向用户说明具体失败环节。
@@ -57,7 +61,7 @@
 
 ```sh
 plugins/codex-token-sidebar/scripts/stop_sidebar.sh --json
-/Applications/ChatGPT.app/Contents/Resources/codex plugin remove codex-token-sidebar@stephen --json
+/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex plugin remove codex-token-sidebar@stephen --json
 ```
 
 Windows 原生 PowerShell：

@@ -16,7 +16,7 @@ import urllib.request
 SOURCES = {name: 'https://learn.chatgpt.com/docs/' + path + '.md' for name, path in (
     ('pricing', 'pricing'), ('speed', 'agent-configuration/speed'), ('models', 'models'))}
 MAX_BYTES = 2 * 1024 * 1024
-ALIASES = {'default': 'standard', 'standard': 'standard', 'priority': 'fast', 'fast': 'fast'}
+ALIASES = {'default': 'standard', 'standard': 'standard', 'priority': 'fast', 'fast': 'fast', 'ultrafast': 'ultrafast'}
 
 
 def validate_card(card):
@@ -33,13 +33,13 @@ def validate_card(card):
         if not isinstance(model, str) or not re.fullmatch(r'[a-z0-9][a-z0-9.-]{0,100}', model):
             raise ValueError('invalid_model_id')
         if not isinstance(rates, dict): raise ValueError('invalid_rates')
-        for key in ('input', 'cachedInput', 'output', 'fastMultiplier'):
-            if key == 'fastMultiplier' and key not in rates: continue
+        for key in ('input', 'cachedInput', 'output', 'fastMultiplier', 'ultrafastMultiplier'):
+            if key.endswith('Multiplier') and key not in rates: continue
             raw = rates.get(key)
             if not isinstance(raw, str) or not re.fullmatch(r'\d{1,9}(?:\.\d{1,9})?', raw):
                 raise ValueError('invalid_numeric_rate')
             value = Decimal(raw)
-            if key == 'fastMultiplier' and value < 1: raise ValueError('invalid_fast_multiplier')
+            if key.endswith('Multiplier') and value < 1: raise ValueError('invalid_fast_multiplier')
     return deepcopy(card)
 
 
@@ -79,32 +79,29 @@ class _Tables(HTMLParser):
             self.table = None
 
 
-def _fast_rates(text, models):
-    # Accept explicit credit-rate clauses only, never speed or API-price multipliers.
-    text = ' '.join(text.split())
+def _speed_rates(text, models):
+    # The credit clause is separate from subscription usage and token speed.
     names = r'GPT-\d+(?:\.\d+)?(?: [A-Z][a-z]+)?'
-    scopes = {}
-    scope = names + r'(?:,? (?:and )?' + names + r')*'
-    patterns = (
-        r'For (?P<scope>' + scope + r'), Fast mode consumes credits at (?P<rate>\d+(?:\.\d+)?)x the Standard rate',
-        r'(?P<scope>' + scope + r') consume(?:s)? credits at (?P<rate>\d+(?:\.\d+)?)x the Standard rate',
-    )
-    for pattern in patterns:
-        for match in re.finditer(pattern, text):
-            scope = match['scope']
-            # Do not let a greedy prefix carry unrelated preceding sentences.
-            scope = scope.rsplit('. ', 1)[-1].rsplit('; ', 1)[-1]
-            ids = [n.lower().replace(' ', '-') for n in re.findall(names, scope)]
-            for identity in ids:
-                scopes.setdefault(identity, set()).add(match['rate'])
     result = {}
-    for model in models:
-        matches = scopes.get(model)
-        if matches is None:
+    for mode, key in (('Fast', 'fastMultiplier'), ('Ultrafast', 'ultrafastMultiplier')):
+        sections = re.findall(r'^## ' + mode + r' mode\s*\n(.*?)(?=^## |\Z)', text, re.M | re.S)
+        if not sections:
+            continue
+        if len(sections) != 1:
+            raise ValueError('speed_section_not_unique')
+        section = ' '.join(sections[0].split())
+        rates = set(re.findall(r'Purchased credits and Enterprise pay-as-you-go usage are billed at (\d+(?:\.\d+)?)x the Standard rate', section))
+        if len(rates) != 1:
+            raise ValueError('credit_multiplier_not_unique')
+        patterns = ([r'Fast mode speeds up supported models, including (.+?), where available\.',
+                     r'For (.+?), the speed increase is \d+(?:\.\d+)?x\.'] if mode == 'Fast'
+                    else [r'For (.+?), Ultrafast uses included subscription limits'])
+        scopes = {name.lower().replace(' ', '-') for pattern in patterns
+                  for scope in re.findall(pattern, section) for name in re.findall(names, scope)}
+        for model in models:
             family = re.match(r'gpt-\d+(?:\.\d+)?', model)
-            matches = scopes.get(family[0], set()) if family and family[0] not in models else set()
-        if len(matches) > 1: raise ValueError('conflicting_fast_rates')
-        if matches: result[model] = next(iter(matches))
+            if model in scopes or (family and family[0] not in models and family[0] in scopes):
+                result.setdefault(model, {})[key] = next(iter(rates))
     return result
 
 
@@ -133,11 +130,12 @@ def parse_documents(documents, previous):
             rates[key] = format(Decimal(raw.removesuffix(' credits').replace(',', '')).normalize(), 'f')
         models[model] = rates
     if set(previous['models']) - set(models): raise ValueError('existing_model_missing')
-    fast = _fast_rates(documents['speed'], models)
-    for model, rate in fast.items(): models[model]['fastMultiplier'] = rate
-    # Existing Fast coverage disappearing indicates a parser/source change.
-    if any('fastMultiplier' in rates and model not in fast for model, rates in previous['models'].items()):
-        raise ValueError('existing_fast_rule_missing')
+    speed = _speed_rates(documents['speed'], models)
+    for model, rates in speed.items(): models[model].update(rates)
+    # Losing an established speed rule is a source/format change, not a zero rate.
+    for model, rates in previous['models'].items():
+        if any(key in rates and key not in models[model] for key in ('fastMultiplier', 'ultrafastMultiplier')):
+            raise ValueError('existing_speed_rule_missing')
     card = {'id': 'pending', 'unit': 'credits_per_million_tokens', 'models': models,
             'tierAliases': ALIASES, 'cacheWritePolicy': 'included_in_input_no_separate_charge',
             'basis': 'published_reference_snapshot_not_historical_invoice',

@@ -19,3 +19,7 @@ dist/
 # Local diagnostics
 *.log
 .local/
+
+# Browser acceptance dependencies and generated evidence
+tests/browser/node_modules/
+output/playwright/

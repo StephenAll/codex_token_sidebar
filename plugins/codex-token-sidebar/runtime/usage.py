@@ -176,10 +176,6 @@ class UsageRecord:
     model_ambiguous: bool = False
     feature_known: bool = True
 
-    def coverage_identity(self):
-        return (self.session_id, self.response_id, self.turn_id,
-                *(getattr(self, key) for key in TOKEN_FIELDS))
-
     def dedupe_key(self) -> tuple[Any, ...]:
         if self.response_id:
             return (self.session_id, self.response_id)
@@ -631,20 +627,20 @@ class UsageByThread:
             self._owners[key] = owner
 
 
-def summarize_coverage(modern: UsageByThread, legacy: UsageByThread, *, covered_threads=()) -> dict:
+def summarize_coverage(modern: UsageByThread, legacy: UsageByThread, *, scopes=()) -> dict:
     """Select overlapping formats per execution, then combine disjoint threads."""
     total, models, features = _empty_totals(), {}, {}
     requests = turns = events = 0
     model_requests = {}
     usage_limits, credit_limits = set(), set()
+    evidence = defaultdict(list)
+    for scope in scopes:
+        evidence[scope.execution_id].append(scope)
     for thread in modern.threads.keys() | legacy.threads.keys():
         current, old = modern.threads.get(thread), legacy.threads.get(thread)
         group = current or old
         report = group.report()
-        if current and old and thread not in covered_threads:
-            usage_limits.add("overlap_unresolved")
-            credit_limits.add("missing_response_records")
-            requests = turns = None
+        usage_limits.update(source_scope_reasons(thread, current, evidence[thread], legacy=old))
         if current:
             if current.incomplete_identities:
                 usage_limits.add("response_identity_missing")
@@ -662,8 +658,7 @@ def summarize_coverage(modern: UsageByThread, legacy: UsageByThread, *, covered_
             target = models.setdefault(row["model"], _empty_totals())
             for field in TOKEN_FIELDS:
                 target[field] += row[field]
-            count = (None if current and (current.incomplete_identities
-                     or (old and thread not in covered_threads)) else row["request_count"])
+            count = None if current and current.incomplete_identities else row["request_count"]
             previous = model_requests.get(row["model"], 0)
             model_requests[row["model"]] = None if count is None or previous is None else previous + count
         rows = report.get("by_feature", [{"feature": FEATURE_TASKS, **report["total"]}])
@@ -682,27 +677,31 @@ def summarize_coverage(modern: UsageByThread, legacy: UsageByThread, *, covered_
     return {"total": total, "by_model": model_rows,
             "by_feature": _rows_by_key(features, "feature", total["total_tokens"]),
             "request_count": requests, "turn_count": turns, "event_count": events,
-            "usage_limits": usage_limits, "credit_limits": credit_limits}
+            "usage_limits": usage_limits, "credit_limits": credit_limits,
+            "completeness": {
+                "status": ("partial" if usage_limits & {"modern_cumulative_inconsistent", "legacy_cumulative_inconsistent"}
+                           else "unknown" if usage_limits else "complete"),
+                "reasons": sorted(usage_limits)}}
 
 
-class CoverageEvidence:
-    """Prove overlap only through closed cumulative checkpoints in one source.
+class SourceScope:
+    """Source-local endpoints; response values remain owned by the canonical ledger.
 
-    Matching aggregate numbers alone do not identify a range. Unsupported or
-    reset ranges remain partial; ordinary appends update these sets in O(1).
+    A checkpoint describes this format's cumulative scope, never the other
+    format's counter. Only metadata and endpoint evidence are retained here.
     """
     def __init__(self, execution_id):
         self.execution_id = execution_id
         self.turn = None
-        self.records = {}
-        self.record_proofs = {}
-        self.total = _empty_totals()
-        self.modern_points = set()
-        self.missing_points = set()
-        self.has_legacy = False
-        self.unconfirmed = False
+        self.has_header = False
+        self.has_modern = False
+        self.anchored = False
+        self.checkpoint = None
+        self.endpoint = None
+        self.legacy_turns = set()
         self.previous_legacy = None
-        self.usage_limitations = set()
+        self.legacy_limitations = set()
+        self.history_unknown = False
 
     @staticmethod
     def vector(usage):
@@ -718,62 +717,74 @@ class CoverageEvidence:
         if kind == "session_meta":
             identity = _identifier(payload.get("id"))
             if identity:
-                if identity != self.execution_id and (self.records or self.has_legacy):
-                    self.unconfirmed = True
+                if identity != self.execution_id and (self.has_modern or self.legacy_turns):
+                    self.history_unknown = True
                 self.execution_id = identity
+                self.has_header = True
         elif kind == "turn_context":
             self.turn = _identifier(payload.get("turn_id"))
         elif kind == "token_usage_record" and payload.get("thread_id") == self.execution_id:
-            response = _identifier(payload.get("response_id"))
-            usage = _raw_usage(payload.get("usage"))
-            if not response or usage is None:
-                self.unconfirmed = True
-                return
-            previous = self.records.get(response)
+            usage = self.vector(payload.get("usage"))
             checkpoint = self.vector(payload.get("thread_token_usage"))
-            turn = _identifier(payload.get("turn_id"))
-            proof = (turn, checkpoint)
-            if previous is not None and (previous != usage or self.record_proofs[response] != proof):
-                # A revision can invalidate earlier prefix proofs. A full file
-                # replacement rebuilds evidence; don't reuse those old proofs.
-                self.unconfirmed = True
-            for key in TOKEN_FIELDS:
-                self.total[key] += usage[key] - (previous[key] if previous else 0)
-            self.records[response] = usage
-            self.record_proofs[response] = proof
-            if turn and checkpoint is not None and checkpoint == self.vector(self.total):
-                point = (turn, checkpoint)
-                self.modern_points.add(point)
-                self.missing_points.discard(point)
+            response = _identifier(payload.get("response_id"))
+            if not self.has_modern:
+                self.anchored = bool(self.has_header and response and usage is not None and usage == checkpoint)
+            self.has_modern = True
+            # Replayed earlier responses do not move a cumulative endpoint back.
+            # A revision of the endpoint itself replaces its previous evidence.
+            if (self.checkpoint is None or checkpoint is None
+                    or checkpoint[-1] >= self.checkpoint[-1]
+                    or response == self.endpoint[0]):
+                self.checkpoint = checkpoint
+                self.endpoint = (response, usage)
         elif kind == "event_msg" and payload.get("type") == "token_count":
             info = payload.get("info")
-            if not isinstance(info, dict):
-                return
-            total = _raw_usage(info.get("total_token_usage"))
-            contribution, limitation = _legacy_usage(total, self.previous_legacy, _raw_usage(info.get("last_token_usage")))
-            if limitation:
-                self.usage_limitations.add(limitation)
-            if (total is not None and self.previous_legacy is not None
-                    and total["total_tokens"] < self.previous_legacy["total_tokens"]):
-                self.unconfirmed = True
-            self.previous_legacy = total if total is not None else self.previous_legacy
-            if contribution is None or not any(contribution.values()):
-                return
-            self.has_legacy = True
-            checkpoint = self.vector(info.get("total_token_usage"))
-            if not self.turn or checkpoint is None:
-                self.unconfirmed = True
-            elif (self.turn, checkpoint) not in self.modern_points:
-                self.missing_points.add((self.turn, checkpoint))
-        if kind not in {"session_meta", "turn_context", "event_msg"}:
-            if _raw_usage(entry.get("usage")) is not None or any(
-                    isinstance(entry.get(key), dict) and "usage" in entry[key]
-                    for key in ("data", "result", "response")):
-                self.has_legacy = self.unconfirmed = True
+            if isinstance(info, dict):
+                total = _raw_usage(info.get("total_token_usage"))
+                _, limitation = _legacy_usage(total, self.previous_legacy, _raw_usage(info.get("last_token_usage")))
+                if limitation:
+                    self.legacy_limitations.add(limitation)
+                self.previous_legacy = total if total is not None else self.previous_legacy
+        if kind == "history_base" or payload.get("history_base") is not None:
+            self.history_unknown = True
 
-    @property
-    def covered(self):
-        return self.has_legacy and not self.unconfirmed and not self.missing_points
+
+def source_scope_reasons(thread, current, scopes, *, legacy=None):
+    """Validate the selected ledger against its own observed endpoints."""
+    if current is None:
+        reasons = set().union(*(scope.legacy_limitations for scope in scopes))
+        if not scopes or any(not scope.has_header or scope.history_unknown for scope in scopes):
+            reasons.add("history_scope_unconfirmed")
+        checkpoints = [scope.previous_legacy for scope in scopes if scope.previous_legacy is not None]
+        if not checkpoints:
+            reasons.add("checkpoint_missing")
+        elif not reasons and max(checkpoints, key=lambda total: total["total_tokens"]) != legacy.total:
+            reasons.add("history_scope_unconfirmed")
+        return reasons
+    reasons = set()
+    owned = [scope for scope in scopes if scope.has_modern]
+    if not owned or any(scope.history_unknown for scope in scopes):
+        reasons.add("history_scope_unconfirmed")
+    for scope in scopes:
+        if any(not turn or (thread, turn) not in current.turns for turn in scope.legacy_turns):
+            reasons.add("legacy_only_turns")
+    checkpoints = [scope for scope in owned if scope.checkpoint is not None]
+    if not checkpoints:
+        reasons.add("checkpoint_missing")
+    if checkpoints:
+        # Cumulative checkpoints are monotonic within an execution. Older
+        # retained copies cannot override the furthest observed endpoint.
+        latest = max(checkpoints, key=lambda scope: scope.checkpoint[-1])
+        endpoint = current.items.get((thread, latest.endpoint[0]))
+        values = tuple(getattr(endpoint, key) for key in TOKEN_FIELDS) if endpoint else None
+        closed = latest.checkpoint == tuple(current.total[key] for key in TOKEN_FIELDS)
+        if values != latest.endpoint[1]:
+            reasons.add("source_conflict")
+        elif not closed:
+            reasons.add("modern_cumulative_inconsistent" if latest.anchored else "history_scope_unconfirmed")
+        if not any(scope.anchored for scope in owned) and not (latest.has_header and closed):
+            reasons.add("history_scope_unconfirmed")
+    return reasons
 
 
 class UsageStream:
@@ -790,7 +801,7 @@ class UsageStream:
         self.source_id = source_id or session_id
         self.execution_id = session_id
         self.credits = CreditEvidence()
-        self.coverage = CoverageEvidence(session_id)
+        self.scope = SourceScope(session_id)
         self.records: dict[tuple[Any, ...], UsageRecord] = {}
         self.events: dict[tuple[Any, ...], UsageEvent] = {}
         self._models: dict[str, set[str]] = defaultdict(set)
@@ -803,7 +814,6 @@ class UsageStream:
         self._legacy_model: str | None = None
         self._legacy_total: dict[str, int] | None = None
         self._legacy_generation = 0
-        self.usage_limitations = self.coverage.usage_limitations
         self._record_changes: dict[tuple[Any, ...], UsageRecord | None] = {}
         self._event_changes: dict[tuple[Any, ...], UsageEvent | None] = {}
 
@@ -890,7 +900,7 @@ class UsageStream:
                 thread, response = _identifier(payload.get("thread_id")), _identifier(payload.get("response_id"))
                 response_key = ((thread or self.execution_id, response) if response
                                 else ("anonymous", self.source_id, self._sequence))
-        self.coverage.feed(entry)
+        self.scope.feed(entry)
         self.credits.feed(entry, execution_id=self.execution_id, response_key=response_key)
         if kind == "session_meta" and isinstance(payload, dict):
             source = payload.get("thread_source") or payload.get("source")
@@ -929,6 +939,7 @@ class UsageStream:
                         and total["total_tokens"] < self._legacy_total["total_tokens"]):
                     self._legacy_generation += 1
         for event in parse_usage_text(prefix + line, self.execution_id):
+            self.scope.legacy_turns.add(self.scope.turn)
             if event.observation:
                 event = replace(event, observation=(self._legacy_generation, *event.observation[1:]))
             key = event.dedupe_key()
@@ -962,8 +973,6 @@ class CreditEvidence:
         self.records = {}
         self.changes = {}
         self.limitations = set()
-        self.thread_totals = Counter()
-        self.cumulative = {}
 
     @staticmethod
     def _tier(value):
@@ -996,9 +1005,10 @@ class CreditEvidence:
         if not isinstance(payload, dict): return
         if kind == 'session_meta':
             provider = payload.get('model_provider')
-            if isinstance(provider, str) and provider != self.provider:
+            if isinstance(provider, str):
                 self.provider = provider
-                for key in self.raw: self._attribute(key, execution_id)
+            # A corrected execution identity also changes metadata ownership.
+            for key in self.raw: self._attribute(key, execution_id)
         elif kind == 'turn_context':
             turn = payload.get('turn_id')
             self.active_turn = turn if isinstance(turn, str) and turn else None
@@ -1017,15 +1027,14 @@ class CreditEvidence:
             thread, response = _identifier(payload.get('thread_id')), _identifier(payload.get('response_id'))
             identity = bool(thread and response)
             key = response_key
+            if not isinstance(payload.get('usage'), dict) and key in self.raw:
+                # Missing usage cannot retract the existing canonical value.
+                return
             turn = payload.get('turn_id')
             turn = turn if isinstance(turn, str) and turn else None
             if key in self.raw:
                 for dependency in (self.raw[key]['turn'], self.raw[key].get('rootTurn')):
                     self.dependencies[dependency].discard(key)
-                old_usage = self.raw[key].get('usage') or {}
-                old_total = old_usage.get('total_tokens')
-                if identity and type(old_total) is int and old_total >= 0:
-                    self.thread_totals[thread] -= old_total
             tier = self._tier(payload['service_tier']) if 'service_tier' in payload else self.tier
             old_tiers = len(self.tiers[turn])
             if tier is not None: self.tiers[turn].add(tier)
@@ -1037,24 +1046,11 @@ class CreditEvidence:
                              'serviceTier': tier, 'usage': {k: usage[k] for k in (
                                  *TOKEN_FIELDS, 'cache_write_input_tokens') if k in usage}
                              if isinstance(usage, dict) else None}
-            total = usage.get('total_tokens') if isinstance(usage, dict) else None
-            if identity and type(total) is int and total >= 0:
-                self.thread_totals[thread] += total
-            cumulative = payload.get('thread_token_usage')
-            cumulative = cumulative.get('total_tokens') if isinstance(cumulative, dict) else None
-            if identity and type(cumulative) is int and cumulative >= 0:
-                self.cumulative[thread] = cumulative
-            if any(total > self.thread_totals[t] for t, total in self.cumulative.items()):
-                self.limitations.add('history_detail_missing')
-            else:
-                self.limitations.discard('history_detail_missing')
             self.dependencies[turn].add(key)
             self.dependencies[root_turn].add(key)
             if len(self.tiers[turn]) > 1 and len(self.tiers[turn]) != old_tiers:
                 self._revisit(turn, execution_id)
             else: self._attribute(key, execution_id)
-        if kind == 'history_base' or payload.get('history_base') is not None:
-            self.limitations.add('history_scope_unconfirmed')
         subtype = str(payload.get('type') or '')
         if any(part in subtype for part in ('image_generation', 'realtime', 'audio')):
             self.limitations.add('unsupported_media')

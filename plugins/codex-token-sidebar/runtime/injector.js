@@ -223,6 +223,19 @@
       var id = fiberConversationId(anchors[i], cache);
       if (id) identities.add(id);
     }
+    if (identities.size) return identities.size === 1 ? identities.values().next().value : null;
+    // The composer exposes its identity even when its localized context label
+    // or React props cannot be read. Empty portal slots have no CSS box; their
+    // visible parent distinguishes them from retained, hidden task trees.
+    var markers = document.querySelectorAll('[data-above-composer-portal][data-above-composer-conversation-id]');
+    for (var j = 0; j < markers.length; j++) {
+      var marker = markers[j], markerId = marker.getAttribute('data-above-composer-conversation-id');
+      if (!CONVERSATION_ID_RE.test(markerId || '') || marker.hidden || marker.inert
+          || marker.getAttribute('aria-hidden') === 'true') continue;
+      if (isVisibleHost(marker) || (!marker.hasChildNodes() && isVisibleHost(marker.parentElement))) {
+        identities.add(markerId);
+      }
+    }
     return identities.size === 1 ? identities.values().next().value : null;
   }
 
@@ -345,6 +358,8 @@
 #codex-token-sidebar.cts-collapsed .cts-toggle svg{transform:rotate(-90deg)}
 #codex-token-sidebar.cts-collapsed .cts-body{display:none}
 #codex-token-sidebar .cts-body{padding:14px 16px 0}
+#codex-token-sidebar .cts-usage-status summary{cursor:pointer}
+#codex-token-sidebar .cts-usage-status div{white-space:pre-line;overflow-wrap:anywhere}
 #codex-token-sidebar .cts-health{padding:8px 16px 0;color:var(--cts-muted);font-size:12px}
 #codex-token-sidebar .cts-credits{display:flex;flex-direction:column;min-width:0;padding-left:12px;font-size:12px}
 #codex-token-sidebar .cts-credits-value{font-size:clamp(20px,9cqi,28px);line-height:1.4;font-weight:650;white-space:nowrap}
@@ -560,7 +575,7 @@
     );
     details.appendChild(
       modelDetail(
-        "请求次数",
+        "已记录请求",
         row.request_count == null ? "—" : formatTokens(row.request_count)
       )
     );
@@ -689,10 +704,25 @@
     }
 
     var totalLine = text("div", "cts-total");
-    var sessionMetric = summaryMetric("当前会话", data.session.total_tokens, true);
-    if (data.sessionUsageCompleteness && data.sessionUsageCompleteness.status === "partial") {
-      var usageStatus = text("div", "cts-muted cts-usage-status", "用量可能不完整");
-      usageStatus.setAttribute("role", "status");
+    var sessionMetric = summaryMetric("已记录用量", data.session.total_tokens, true);
+    var scope = data.sessionUsageCompleteness;
+    if (scope && (scope.status === "unknown" || scope.status === "partial")) {
+      var explanations = {
+        history_scope_unconfirmed: "无法确认是否已包含较早的历史用量。",
+        checkpoint_missing: "缺少用于核实统计范围的累计记录。",
+        legacy_only_turns: "部分轮次只有历史统计，尚无对应的响应明细。",
+        source_conflict: "不同来源记录的响应数值存在差异。",
+        response_identity_missing: "部分响应缺少标识，无法确认请求数。",
+        modern_cumulative_inconsistent: "已记录响应的合计与其累计用量不一致。",
+        legacy_cumulative_inconsistent: "历史累计记录的数值变化不一致。"
+      };
+      var usageStatus = text("details", "cts-muted cts-usage-status");
+      var known = (scope.reasons || []).some(function (reason) { return explanations[reason]; });
+      usageStatus.appendChild(text("summary", "", scope.status === "unknown"
+        ? "统计范围待确认" : known ? "用量记录校验异常" : "用量可能不完整"));
+      usageStatus.appendChild(text("div", "", (scope.reasons || []).map(function (reason) {
+        return explanations[reason] || "部分历史用量的范围尚无法确认。";
+      }).join("\n")));
       sessionMetric.appendChild(usageStatus);
     }
     totalLine.appendChild(sessionMetric);
@@ -704,7 +734,9 @@
     if (credits) {
       var details = [];
       if (credits.unpricedResponses > 0) details.push(credits.unpricedResponses + " 条响应暂无法计价");
-      if (credits.limitations && credits.limitations.length) details.push("历史用量可能不完整");
+      if (credits.limitations && credits.limitations.some(function (reason) { return reason !== "read_incomplete"; })) {
+        details.push("部分已记录用量暂无法计价");
+      }
       if (credits.rateStatus === "stale") {
         creditRow.appendChild(text("span", "cts-muted", "费率未更新"));
       }

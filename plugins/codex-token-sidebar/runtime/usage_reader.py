@@ -76,7 +76,6 @@ class UsageReader:
         self.rate_source = rate_source
         self._rate_status = "bundled"
         self._contributors: tuple[dict, dict] = ({}, {})
-        self._proof_mismatches: dict[str, set] = {}
         self._totals = (UsageByThread(modern=True), UsageByThread(modern=False))
         self._discoverer = discoverer or RolloutCatalog(
             self.sessions_dir, clock=clock, discovery_interval=discovery_interval)
@@ -128,15 +127,6 @@ class UsageReader:
                 values = [bucket[name] for name in sorted(bucket, key=Path)]
                 winner = merge_usage_sources(values) if totals.modern else (values[-1] if values else None)
                 totals.set(key, winner)
-                if totals.modern:
-                    self._proof_mismatches.setdefault(path, set()).discard(key)
-                    for source, candidate in bucket.items():
-                        invalid = self._proof_mismatches.setdefault(source, set())
-                        if (candidate.metadata_owned
-                                and candidate.coverage_identity() != winner.coverage_identity()):
-                            invalid.add(key)
-                        else:
-                            invalid.discard(key)
                 if not bucket:
                     sources.pop(key, None)
 
@@ -160,7 +150,6 @@ class UsageReader:
             self._apply_credits(path, {key: None for key in state.parser.credits.records})
             self._apply_changes(path, ({key: None for key in state.parser.records},
                                        {key: None for key in state.parser.events}))
-        self._proof_mismatches.pop(path, None)
 
     def _refresh_file(self, path: Path, expected: tuple[int, ...]) -> None:
         key = str(path)
@@ -270,15 +259,7 @@ class UsageReader:
             self.read_status = 'deferred' if self._snapshot['status'] == 'ok' else 'failed'
             return deepcopy(self._snapshot)
         modern, legacy = self._totals
-        coverage = {}
-        for path, state in self._states.items():
-            evidence = state.parser.coverage
-            if state.parser.events:
-                coverage[evidence.execution_id] = (coverage.get(evidence.execution_id, True)
-                    and evidence.covered and not self._proof_mismatches.get(path))
-        summary = summarize_coverage(modern, legacy, covered_threads={thread for thread, complete in coverage.items() if complete})
-        summary["usage_limits"].update(set().union(*(state.parser.usage_limitations
-                                                   for state in self._states.values())))
+        summary = summarize_coverage(modern, legacy, scopes=(state.parser.scope for state in self._states.values()))
         limitations = set().union(*(state.parser.credits.limitations for state in self._states.values()))
         limitations.update(summary["credit_limits"])
         if (modern.threads or legacy.threads) and not self._credits.records:
@@ -292,9 +273,7 @@ class UsageReader:
             "conversationId": session_id,
             "session": summary["total"],
             "sessionCredits": credit_report,
-            "sessionUsageCompleteness": {
-                "status": "partial" if summary["usage_limits"] else "complete",
-                "reasons": sorted(summary["usage_limits"])},
+            "sessionUsageCompleteness": summary["completeness"],
             "sessionByFeature": summary["by_feature"],
             "sessionByModel": summary["by_model"],
             "sessionEventCount": summary["event_count"],

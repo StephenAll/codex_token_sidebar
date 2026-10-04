@@ -9,6 +9,9 @@ def merge_credit_sources(records):
     records = list(records)
     if not records:
         return None
+    # Token parsing skips absent usage. Prefer the same contributing sources;
+    # retain an unpriced observation only when no source has a usage object.
+    records = [record for record in records if isinstance(record.get('usage'), dict)] or records
     candidates = [record for record in records if record.get('metadataOwned')] or records
     result = deepcopy(candidates[-1])
     for field, conflict in (('provider', None), ('model', 'modelAmbiguous'),

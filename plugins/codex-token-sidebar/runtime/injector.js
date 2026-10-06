@@ -46,6 +46,7 @@
   var heartbeatTimeout = 45000;
   var readerStatus = "waiting";
   var healthNode = null;
+  var performanceObserver = null;
   var healthText = "";
   var reroutesByConversation = new Map();
   var rerouteSequence = 0;
@@ -358,8 +359,19 @@
 #codex-token-sidebar.cts-collapsed .cts-toggle svg{transform:rotate(-90deg)}
 #codex-token-sidebar.cts-collapsed .cts-body{display:none}
 #codex-token-sidebar .cts-body{padding:14px 16px 0}
-#codex-token-sidebar .cts-usage-status summary{cursor:pointer}
-#codex-token-sidebar .cts-usage-status div{white-space:pre-line;overflow-wrap:anywhere}
+#codex-token-sidebar .cts-performance{position:relative;border-top:1px solid var(--cts-rule);padding:12px 0;font-size:12px}
+#codex-token-sidebar .cts-performance-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
+#codex-token-sidebar .cts-performance-title{font-size:14px;font-weight:600}
+#codex-token-sidebar .cts-performance-average{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:flex-end;gap:4px;max-width:60%}
+#codex-token-sidebar .cts-performance-value{font-size:18px;font-weight:650;max-width:100%;overflow-wrap:anywhere}
+#codex-token-sidebar .cts-performance-legend{display:flex;flex-wrap:wrap;gap:12px;margin:10px 0 2px;font-size:12px}
+#codex-token-sidebar .cts-performance-legend>span{display:flex;gap:5px;align-items:center}
+#codex-token-sidebar .cts-rate-legend i{width:14px;height:2px;background:#568fe8}
+#codex-token-sidebar .cts-latency-legend i{width:10px;height:10px;background:#a49aba;opacity:.6}
+#codex-token-sidebar .cts-performance-plot svg{display:block;overflow:visible;font-size:12px}
+#codex-token-sidebar .cts-performance-plot text{font-size:12px}
+#codex-token-sidebar .cts-turn-hit:focus-visible{outline:none;stroke:#568fe8;stroke-width:1}
+#codex-token-sidebar .cts-turn-tooltip{position:absolute;z-index:2;left:0;right:0;bottom:28px;padding:8px 10px;border:1px solid #777;border-radius:6px;background:#252525;color:#fff;white-space:pre-line;overflow-wrap:anywhere;font-size:12px;pointer-events:none}
 #codex-token-sidebar .cts-health{padding:8px 16px 0;color:var(--cts-muted);font-size:12px}
 #codex-token-sidebar .cts-credits{display:flex;flex-direction:column;min-width:0;padding-left:12px;font-size:12px}
 #codex-token-sidebar .cts-credits-value{font-size:clamp(20px,9cqi,28px);line-height:1.4;font-weight:650;white-space:nowrap}
@@ -490,7 +502,7 @@
     return n.toFixed(1).replace(/\.0$/, "") + "%";
   }
 
-  function formatCredits(value) {
+  function formatDecimal(value) {
     var amount = value == null ? NaN : Number(value);
     if (!Number.isFinite(amount) || amount < 0) return "—";
     if (amount > 0 && amount < 0.1) return "<0.1";
@@ -549,7 +561,7 @@
     var metrics = text("div", "cts-model-metrics");
     var modelCredits = credits && credits[row.model];
     var creditMetric = modelMetric("Credits",
-      formatCredits(modelCredits && modelCredits.estimatedCredits), "cts-model-credit");
+      formatDecimal(modelCredits && modelCredits.estimatedCredits), "cts-model-credit");
     if (modelCredits && modelCredits.unpricedResponses > 0) {
       creditMetric.title = modelCredits.unpricedResponses + " 条响应暂无法计价";
     }
@@ -676,6 +688,122 @@
     body.appendChild(section);
   }
 
+  function appendTurnPerformance(body, performanceData) {
+    if (!performanceData || !Array.isArray(performanceData.turns)) return;
+    var rows = performanceData.turns.slice(-10);
+    var section = text("section", "cts-performance");
+    var heading = text("div", "cts-performance-heading");
+    heading.appendChild(text("span", "cts-performance-title", "最近 10 轮"));
+    var metric = text("div", "cts-performance-average");
+    var label = text("span", "cts-muted", "平均速率");
+    label.title = "总输出 Token ÷ 总耗时，包含等待和工具执行时间。\n基于 "
+      + (performanceData.averageSampleCount || 0) + "/" + rows.length + " 轮。";
+    metric.appendChild(label);
+    metric.appendChild(text("span", "cts-performance-value", formatDecimal(performanceData.averageOutputTokensPerSecond)));
+    metric.appendChild(text("span", "cts-muted", "Token/s"));
+    heading.appendChild(metric);
+    section.appendChild(heading);
+    body.appendChild(section);
+    if (!rows.length) {
+      section.appendChild(text("div", "cts-muted", performanceData.windowUnavailableReason
+        ? "轮次时间暂无法确认" : "暂无已完成轮次"));
+      return;
+    }
+    var legend = text("div", "cts-performance-legend");
+    ["输出速率", "首 Token 延迟"].forEach(function (name, index) {
+      var entry = text("span", index ? "cts-latency-legend" : "cts-rate-legend");
+      entry.appendChild(text("i", "")); entry.appendChild(text("span", "", name)); legend.appendChild(entry);
+    });
+    section.appendChild(legend);
+    var plot = text("div", "cts-performance-plot");
+    section.appendChild(plot);
+    var tooltip = text("div", "cts-turn-tooltip");
+    tooltip.hidden = true;
+    tooltip.setAttribute("role", "tooltip");
+    section.appendChild(tooltip);
+    var rateColor = "#568fe8", latencyColor = "#a49aba";
+    function valid(value) { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
+    function svgNode(tag, attrs, value) {
+      var node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+      Object.keys(attrs || {}).forEach(function (key) { node.setAttribute(key, String(attrs[key])); });
+      if (value != null) node.textContent = value;
+      return node;
+    }
+    var lastWidth = 0;
+    function draw(width) {
+      width = Math.round(width);
+      if (width <= 0 || width === lastWidth || disposed) return;
+      lastWidth = width;
+      plot.replaceChildren(); tooltip.hidden = true;
+      var svg = svgNode("svg", {width:"100%", height:176, viewBox:"0 0 " + width + " 176", "aria-label":"最近轮次输出速率与首 Token 延迟"});
+      plot.appendChild(svg);
+      var left = 40, right = width - 36, top = 28, bottom = 146;
+      var cell = Math.max(1, right - left) / rows.length;
+      var rates = rows.map(function (row) { return row.outputTokensPerSecond; });
+      var delays = rows.map(function (row) { return valid(row.firstTokenLatencyMs) ? row.firstTokenLatencyMs / 1000 : null; });
+      var rateMax = Math.max.apply(null, [1].concat(rates.filter(valid)));
+      var delayMax = Math.max.apply(null, [1].concat(delays.filter(valid)));
+      function y(value, max) { return bottom - value / max * (bottom - top); }
+      function tick(value) { return value >= 1000 ? formatTokens(value) : formatDecimal(value); }
+      svg.appendChild(svgNode("text", {x:0, y:14, fill:rateColor}, "Token/s"));
+      svg.appendChild(svgNode("text", {x:width, y:14, "text-anchor":"end", fill:"currentColor"}, "秒"));
+      [0, 0.5, 1].forEach(function (fraction) {
+        var height = y(fraction, 1);
+        svg.appendChild(svgNode("line", {x1:left, x2:right, y1:height, y2:height, stroke:"currentColor", opacity:0.12}));
+        svg.appendChild(svgNode("text", {x:left-7, y:height+4, "text-anchor":"end", fill:"currentColor"}, tick(fraction*rateMax)));
+        svg.appendChild(svgNode("text", {x:right+6, y:height+4, fill:"currentColor"}, tick(fraction*delayMax)));
+      });
+      rows.forEach(function (row, i) {
+        var center = left + cell * (i + 0.5);
+        if (valid(delays[i])) {
+          var barWidth = Math.max(1, Math.min(18, cell * 0.6));
+          svg.appendChild(svgNode("rect", {class:"cts-latency-bar", x:center-barWidth/2, y:y(delays[i],delayMax),
+            width:barWidth, height:bottom-y(delays[i],delayMax), fill:latencyColor, opacity:0.45}));
+        }
+        if (width >= 300 || i === 0 || i === rows.length-1 || i === Math.floor((rows.length-1)/2)) {
+          svg.appendChild(svgNode("text", {x:center,y:168,"text-anchor":"middle",fill:"currentColor"}, String(i+1)));
+        }
+      });
+      var path = "", connected = false;
+      rates.forEach(function (rate, i) {
+        if (!valid(rate)) { connected = false; return; }
+        path += (connected ? "L" : "M") + (left + cell*(i+0.5)) + "," + y(rate,rateMax) + " ";
+        connected = true;
+      });
+      if (path) svg.appendChild(svgNode("path", {class:"cts-rate-line",d:path,fill:"none",stroke:rateColor,"stroke-width":2}));
+      rates.forEach(function (rate, i) {
+        if (valid(rate)) svg.appendChild(svgNode("circle", {class:"cts-rate-dot",cx:left+cell*(i+0.5),cy:y(rate,rateMax),r:3,fill:rateColor}));
+      });
+      var reasons = {turn_start_missing:"缺少轮次开始记录",duration_unavailable:"耗时记录不可用",
+        latency_unavailable:"首 Token 延迟不可用",output_usage_unavailable:"输出用量记录不足",
+        source_conflict:"来源记录存在差异",turn_usage_scope_unconfirmed:"轮次用量范围尚无法确认"};
+      rows.forEach(function (row, i) {
+        var date = new Date(row.completedAt);
+        var detail = "第 " + (i+1) + " 轮 · " + (isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", {hour12:false}))
+          + "\n输出速率：" + formatDecimal(rates[i]) + " Token/s"
+          + "\n首 Token 延迟：" + formatDecimal(delays[i]) + " 秒";
+        [row.rateUnavailableReason,row.latencyUnavailableReason].forEach(function (reason) {
+          if (reasons[reason] && detail.indexOf(reasons[reason]) === -1) detail += "\n" + reasons[reason];
+        });
+        var hit = svgNode("rect", {class:"cts-turn-hit",x:left+cell*i,y:top,width:cell,height:bottom-top,
+          fill:"transparent",tabindex:0,"aria-label":detail});
+        function show() { tooltip.textContent = detail; tooltip.hidden = false; }
+        function hide() { tooltip.hidden = true; }
+        hit.addEventListener("mouseenter",show); hit.addEventListener("focus",show);
+        hit.addEventListener("mouseleave",hide); hit.addEventListener("blur",hide);
+        hit.addEventListener("keydown",function (event) { if (event.key === "Escape") hide(); });
+        svg.appendChild(hit);
+      });
+    }
+    draw(plot.clientWidth || 300);
+    if (typeof ResizeObserver !== "undefined") {
+      performanceObserver = new ResizeObserver(function (entries) {
+        if (entries[0]) draw(entries[0].contentRect.width);
+      });
+      performanceObserver.observe(plot);
+    }
+  }
+
   function render(node, data) {
     var body = node.querySelector(".cts-body");
     if (!body) return;
@@ -687,9 +815,16 @@
       return;
     }
     node.__ctsRenderSignature = signature;
+    if (performanceObserver) performanceObserver.disconnect();
+    performanceObserver = null;
     body.replaceChildren();
     if (!data || data.status !== "ok") {
       body.appendChild(text("div", "cts-muted", "等待当前会话用量…"));
+      if (data && data.conversationId === activeId && data.selectionEpoch === selectionEpoch
+          && data.sessionTurnPerformance && Array.isArray(data.sessionTurnPerformance.turns)
+          && data.sessionTurnPerformance.turns.length) {
+        appendTurnPerformance(body, data.sessionTurnPerformance);
+      }
       appendReroutes(body, activeId);
       return;
     }
@@ -716,31 +851,33 @@
         modern_cumulative_inconsistent: "已记录响应的合计与其累计用量不一致。",
         legacy_cumulative_inconsistent: "历史累计记录的数值变化不一致。"
       };
-      var usageStatus = text("details", "cts-muted cts-usage-status");
-      var known = (scope.reasons || []).some(function (reason) { return explanations[reason]; });
-      usageStatus.appendChild(text("summary", "", scope.status === "unknown"
-        ? "统计范围待确认" : known ? "用量记录校验异常" : "用量可能不完整"));
-      usageStatus.appendChild(text("div", "", (scope.reasons || []).map(function (reason) {
+      sessionMetric.querySelector(".cts-summary-label").title = (scope.reasons || []).map(function (reason) {
         return explanations[reason] || "部分历史用量的范围尚无法确认。";
-      }).join("\n")));
-      sessionMetric.appendChild(usageStatus);
+      }).join("\n");
     }
     totalLine.appendChild(sessionMetric);
     var credits = data.sessionCredits;
     var creditRow = text("div", "cts-credits");
-    creditRow.appendChild(text("span", "cts-summary-label", "参考 Credits"));
+    var creditLabel = text("span", "cts-summary-label", "参考 Credits");
+    creditRow.appendChild(creditLabel);
     creditRow.appendChild(text("span", "cts-credits-value",
-      formatCredits(credits && credits.estimatedCredits)));
+      formatDecimal(credits && credits.estimatedCredits)));
     if (credits) {
       var details = [];
+      var verified = credits.rateVerifiedAt && new Date(credits.rateVerifiedAt);
+      var checked = verified && !isNaN(verified.getTime())
+        ? verified.toLocaleString("zh-CN", {hour12:false}) : credits.rateVerifiedOn;
+      if (checked) details.push("最近核实：" + checked);
+      if (credits.rateStatus === "stale") {
+        var failures = {fetch_timeout:"官方来源请求超时", fetch_failed:"无法获取官方费率来源",
+          parse_failed:"官方来源未通过费率校验", cache_write_failed:"无法保存费率缓存"};
+        details.push("最近刷新失败：" + (failures[credits.rateRefreshError] || "原因未记录"));
+      }
       if (credits.unpricedResponses > 0) details.push(credits.unpricedResponses + " 条响应暂无法计价");
       if (credits.limitations && credits.limitations.some(function (reason) { return reason !== "read_incomplete"; })) {
         details.push("部分已记录用量暂无法计价");
       }
-      if (credits.rateStatus === "stale") {
-        creditRow.appendChild(text("span", "cts-muted", "费率未更新"));
-      }
-      if (details.length) creditRow.title = details.join("\n");
+      if (details.length) creditLabel.title = details.join("\n");
     }
     totalLine.appendChild(creditRow);
     body.appendChild(totalLine);
@@ -748,6 +885,7 @@
     breakdown.appendChild(breakdownMetric("输入", data.session.input_tokens));
     breakdown.appendChild(breakdownMetric("输出", data.session.output_tokens));
     body.appendChild(breakdown);
+    appendTurnPerformance(body, data.sessionTurnPerformance);
 
     appendReroutes(body, activeId, data.sessionByModel);
 
@@ -916,6 +1054,7 @@
   window.__codexTokenSidebarDispose = function () {
     disposed = true;
     clearInterval(healthTimer);
+    if (performanceObserver) performanceObserver.disconnect();
     observer.disconnect();
     routeObserver.disconnect();
     if (frameId !== null) cancelAnimationFrame(frameId);

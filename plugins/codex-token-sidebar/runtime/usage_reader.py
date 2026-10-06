@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable
 
 from usage import (
-    UsageStream, UsageByThread, summarize_coverage, merge_usage_sources,
+    UsageStream, UsageByThread, summarize_coverage, merge_usage_sources, turn_performance,
 )
 from credits import CreditsLedger, merge_credit_sources
 from rate_sync import bundled_card
@@ -75,6 +75,7 @@ class UsageReader:
         self._credit_sources = {}
         self.rate_source = rate_source
         self._rate_status = "bundled"
+        self._rate_error = None
         self._contributors: tuple[dict, dict] = ({}, {})
         self._totals = (UsageByThread(modern=True), UsageByThread(modern=False))
         self._discoverer = discoverer or RolloutCatalog(
@@ -221,8 +222,9 @@ class UsageReader:
         if self.rate_source is not None:
             card, status = self.rate_source.poll(bool(self._credits.reasons.get('no_public_model_rate')))
             self.set_rate_card(card)
-            if status != self._rate_status:
-                self._rate_status = status
+            error = self.rate_source.failure_reason if status == 'stale' else None
+            if (status, error) != (self._rate_status, self._rate_error):
+                self._rate_status, self._rate_error = status, error
                 self._snapshot_key = None
         paths = self._session_paths(session_id or "")
         if self._discovery_failed:
@@ -268,10 +270,16 @@ class UsageReader:
         credit_report = self._credits.report(limitations)
         credit_report['rateStatus'] = self._rate_status
         credit_report['rateVerifiedOn'] = self._credits.card.get('verifiedOn')
+        if self._credits.card.get('verifiedAt'):
+            credit_report['rateVerifiedAt'] = self._credits.card['verifiedAt']
+        if self._rate_error:
+            credit_report['rateRefreshError'] = self._rate_error
         payload = {
             "status": "ok" if session_id and (modern.threads or legacy.threads) else "waiting",
             "conversationId": session_id,
             "session": summary["total"],
+            "sessionTurnPerformance": turn_performance(session_id, modern.threads.get(session_id),
+                                                       (state.parser for state in self._states.values())),
             "sessionCredits": credit_report,
             "sessionUsageCompleteness": summary["completeness"],
             "sessionByFeature": summary["by_feature"],

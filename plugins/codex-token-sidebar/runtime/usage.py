@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
+from datetime import datetime, timezone
+from heapq import nlargest
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from typing import Any, Iterable
@@ -175,6 +178,9 @@ class UsageRecord:
     local_identity: tuple = ()
     model_ambiguous: bool = False
     feature_known: bool = True
+    output_tokens_known: bool = False
+    turn_output_checkpoint: int | None = None
+    performance_conflict: bool = False
 
     def dedupe_key(self) -> tuple[Any, ...]:
         if self.response_id:
@@ -192,6 +198,32 @@ class UsageRecord:
             self.reasoning_output_tokens,
             self.total_tokens,
         )
+
+
+def _nonnegative_integer(value):
+    return value if type(value) is int and value >= 0 else None
+
+
+def _performance_fields(payload):
+    raw = payload.get("usage")
+    output = _nonnegative_integer(raw.get("output_tokens")) if isinstance(raw, dict) else None
+    checkpoint = payload.get("turn_token_usage")
+    return {"output_tokens_known": output is not None,
+            "turn_output_checkpoint": _nonnegative_integer(checkpoint.get("output_tokens"))
+            if isinstance(checkpoint, dict) else None}
+
+
+def _completion_time(value):
+    try:
+        if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+            return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="milliseconds")
+        if isinstance(value, str):
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
 
 
 def _event_from_usage(
@@ -405,6 +437,7 @@ def parse_usage_records(text: str, session_id: str, *, source_id: str | None = N
             identity_complete=bool(thread_id and _identifier(payload.get("response_id"))),
             local_identity=("anonymous", source_id or session_id, sequence),
             model_ambiguous=ambiguous, feature_known=thread_source is not None,
+            **_performance_fields(payload),
         )
         records[record.dedupe_key()] = record
     return list(records.values())
@@ -466,7 +499,11 @@ def merge_usage_sources(records: Iterable[UsageRecord]) -> UsageRecord | None:
     models = {record.model for record in candidates if record.model != "unknown"}
     ambiguous = len(models) > 1 or any(record.model_ambiguous for record in candidates)
     feature = next((record.feature for record in reversed(candidates) if record.feature_known), winner.feature)
-    return replace(winner, model=next(iter(models)) if len(models) == 1 and not ambiguous else "unknown",
+    signatures = {(r.turn_id, r.output_tokens, r.output_tokens_known) for r in candidates}
+    checkpoints = {r.turn_output_checkpoint for r in candidates if r.turn_output_checkpoint is not None}
+    conflict = len(signatures) > 1 or len(checkpoints) > 1 or any(r.performance_conflict for r in candidates)
+    return replace(winner, performance_conflict=conflict,
+                   turn_output_checkpoint=next(iter(checkpoints)) if len(checkpoints) == 1 else None, model=next(iter(models)) if len(models) == 1 and not ambiguous else "unknown",
                    model_ambiguous=ambiguous, feature=feature,
                    feature_known=any(record.feature_known for record in candidates),
                    identity_complete=any(record.identity_complete for record in candidates))
@@ -548,6 +585,7 @@ class UsageAccumulator:
         self.model_sizes: Counter = Counter()
         self.requests: Counter = Counter()
         self.turns: Counter = Counter()
+        self.turn_usage = {}
         self.model_requests: dict[str, Counter] = {}
 
     @staticmethod
@@ -567,6 +605,20 @@ class UsageAccumulator:
             self._count(self.requests, request, delta)
             self._count(self.turns, turn, delta)
             self._count(self.model_requests.setdefault(item.model, Counter()), request, delta)
+            if item.turn_id:
+                usage = self.turn_usage.setdefault(item.turn_id, {"output": 0, "invalid": 0,
+                                                               "conflicts": 0, "checkpoints": Counter()})
+                usage["output"] += item.output_tokens * delta
+                usage["invalid"] += delta * (not (item.output_tokens_known and item.identity_complete and item.metadata_owned))
+                usage["conflicts"] += delta * item.performance_conflict
+                checkpoint = item.turn_output_checkpoint
+                if checkpoint is not None:
+                    usage["checkpoints"][checkpoint] += delta
+                    if not usage["checkpoints"][checkpoint]:
+                        del usage["checkpoints"][checkpoint]
+                if turn not in self.turns:
+                    del self.turn_usage[item.turn_id]
+
         for group in groups:
             for field in TOKEN_FIELDS:
                 group[field] += getattr(item, field) * delta
@@ -816,6 +868,7 @@ class UsageStream:
         self._legacy_generation = 0
         self._record_changes: dict[tuple[Any, ...], UsageRecord | None] = {}
         self._event_changes: dict[tuple[Any, ...], UsageEvent | None] = {}
+        self.turn_timings = {}
 
     def _winner(self, key: tuple[Any, ...]) -> None:
         bucket = self._buckets.get(key, {})
@@ -847,6 +900,7 @@ class UsageStream:
             identity_complete=bool(payload["thread_id"] and payload["response_id"]),
             local_identity=("anonymous", self.source_id, payload["local_sequence"]),
             model_ambiguous=ambiguous, feature_known=self._source is not None,
+            **payload["performance"],
             feature=_feature_for_record(self._source, payload, model), **payload["usage"])
         self._attributed[raw_key] = record
         key = record.dedupe_key()
@@ -861,6 +915,7 @@ class UsageStream:
             "response_id", "turn_id", "root_turn_id", "thread_id")}
         normalized["session_id"] = str(payload.get("session_id") or self.session_id)
         normalized["usage"] = usage
+        normalized["performance"] = _performance_fields(payload)
         normalized["local_sequence"] = self._sequence
         normalized["model"] = _first_model(payload)
         previous = self._raw.get(raw_key)
@@ -877,7 +932,8 @@ class UsageStream:
     def feed_line(self, line: str) -> None:
         if not any(marker in line for marker in (
                 '"token_usage_record"', '"session_meta"', '"turn_context"', '"token_count"', '"usage"', '"thread_settings_applied"',
-                '"history_base"', '"image_generation', '"realtime', '"audio')):
+                '"history_base"', '"image_generation', '"realtime', '"audio',
+                '"task_started"', '"task_complete"')):
             return
         try:
             entry = json.loads(line)
@@ -900,6 +956,21 @@ class UsageStream:
                 thread, response = _identifier(payload.get("thread_id")), _identifier(payload.get("response_id"))
                 response_key = ((thread or self.execution_id, response) if response
                                 else ("anonymous", self.source_id, self._sequence))
+        if previous_execution != self.execution_id:
+            self.turn_timings.clear()
+        if (kind == "event_msg" and isinstance(payload, dict) and self.scope.has_header
+                and payload.get("thread_id", self.execution_id) == self.execution_id
+                and _identifier(payload.get("turn_id"))):
+            subtype = payload.get("type")
+            if subtype in {"task_started", "task_complete"}:
+                timing = self.turn_timings.setdefault(payload["turn_id"], {"started": False, "complete": None})
+                if subtype == "task_started":
+                    timing["started"] = True
+                else:
+                    timing["complete"] = (
+                        _completion_time(payload.get("completed_at")) or _completion_time(entry.get("timestamp")),
+                        _nonnegative_integer(payload.get("duration_ms")),
+                        _nonnegative_integer(payload.get("time_to_first_token_ms")))
         self.scope.feed(entry)
         self.credits.feed(entry, execution_id=self.execution_id, response_key=response_key)
         if kind == "session_meta" and isinstance(payload, dict):
@@ -958,6 +1029,64 @@ class UsageStream:
         changes = self._record_changes, self._event_changes
         self._record_changes, self._event_changes = {}, {}
         return changes
+
+
+def turn_performance(thread, current, streams):
+    """Join owned timing evidence to canonical turn totals, without pricing/UI state."""
+    timings = defaultdict(list)
+    for stream in streams:
+        if stream.execution_id == thread and stream.scope.has_header:
+            for turn, evidence in stream.turn_timings.items():
+                timings[turn].append(evidence)
+    result = {"windowSize": 10, "turns": [], "averageOutputTokensPerSecond": None,
+              "averageSampleCount": 0, "windowUnavailableReason": None}
+    completed = []
+    for turn, evidence in timings.items():
+        completions = {e["complete"] for e in evidence if e["complete"] is not None}
+        if not completions:
+            continue
+        dates = {e[0] for e in completions}
+        if len(dates) != 1 or None in dates:
+            result["windowUnavailableReason"] = "completion_time_unconfirmed"
+            return result
+        completed.append((next(iter(dates)), turn, evidence, completions))
+    output_sum = duration_sum = 0
+    for date, turn, evidence, completions in sorted(nlargest(10, completed, key=lambda row: (row[0], row[1])),
+                                                   key=lambda row: (row[0], row[1])):
+        durations = {e[1] for e in completions}
+        latencies = {e[2] for e in completions}
+        duration = next(iter(durations)) if len(durations) == 1 else None
+        latency = next(iter(latencies)) if len(latencies) == 1 else None
+        latency_reason = None
+        if duration is None or duration <= 0:
+            latency_reason = "duration_unavailable"
+        elif latency is None or latency > duration:
+            latency_reason = "latency_unavailable"
+        usage = current.turn_usage.get(turn) if current else None
+        reason = None
+        if not any(e["started"] for e in evidence):
+            reason = "turn_start_missing"
+        elif duration is None or duration <= 0:
+            reason = "duration_unavailable"
+        elif not usage or usage["invalid"]:
+            reason = "output_usage_unavailable"
+        elif usage["conflicts"]:
+            reason = "source_conflict"
+        elif not usage["checkpoints"] or max(usage["checkpoints"]) != usage["output"]:
+            reason = "turn_usage_scope_unconfirmed"
+        output = usage["output"] if usage and not usage["invalid"] else None
+        rate = output * 1000 / duration if reason is None else None
+        if rate is not None:
+            result["averageSampleCount"] += 1
+            output_sum += output
+            duration_sum += duration
+        result["turns"].append({"turnId": turn, "completedAt": date,
+            "outputTokens": output, "durationMs": duration,
+            "outputTokensPerSecond": rate, "firstTokenLatencyMs": latency if latency_reason is None else None,
+            "rateUnavailableReason": reason, "latencyUnavailableReason": latency_reason})
+    if duration_sum:
+        result["averageOutputTokensPerSecond"] = output_sum * 1000 / duration_sum
+    return result
 
 
 class CreditEvidence:

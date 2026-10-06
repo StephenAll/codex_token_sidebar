@@ -140,6 +140,7 @@ def parse_documents(documents, previous):
             'tierAliases': ALIASES, 'cacheWritePolicy': 'included_in_input_no_separate_charge',
             'basis': 'published_reference_snapshot_not_historical_invoice',
             'sources': list(SOURCES.values()), 'verifiedOn': datetime.now(timezone.utc).date().isoformat(),
+            'verifiedAt': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'sourceHashes': {k: hashlib.sha256(v.encode()).hexdigest() for k, v in documents.items()}}
     card = validate_card(card)
     card['id'] = version(card)
@@ -176,6 +177,7 @@ class RateSync:
         self._card = bundled_card()
         self._previous = self._card
         self._status = 'bundled'
+        self._failure_reason = None
         self._next = 0
         self._last_attempt = float('-inf')
         self._failures = 0
@@ -191,6 +193,11 @@ class RateSync:
         except (OSError, ValueError, KeyError, TypeError, InvalidOperation):
             pass
 
+    @property
+    def failure_reason(self):
+        with self._lock:
+            return self._failure_reason
+
     def poll(self, unknown_model=False):
         with self._lock:
             now = self.clock()
@@ -202,10 +209,13 @@ class RateSync:
             return deepcopy(self._card), self._status
 
     def _refresh(self):
+        stage = 'fetch'
         try:
             with self._lock: previous = deepcopy(self._card)
             documents = {name: self.fetch(url) for name, url in SOURCES.items()}
+            stage = 'parse'
             card = parse_documents(documents, previous)
+            stage = 'cache_write'
             with self._lock:
                 if self._closed: return
                 retained = previous if card['id'] != previous['id'] else self._previous
@@ -221,13 +231,16 @@ class RateSync:
                     os.replace(name, self.path)
                     self._card, self._previous, self._status = card, retained, 'current'
                     self._failures = 0
+                    self._failure_reason = None
                     self._next = self.clock() + 21600
             finally:
                 if os.path.exists(name): os.unlink(name)
-        except Exception:
+        except Exception as exc:
             with self._lock:
                 if self._closed: return
                 self._status = 'stale'
+                timeout = isinstance(exc, TimeoutError) or isinstance(getattr(exc, 'reason', None), TimeoutError)
+                self._failure_reason = 'fetch_timeout' if stage == 'fetch' and timeout else stage + '_failed'
                 self._failures += 1
                 self._next = self.clock() + min(21600, 300 * 2**min(self._failures-1, 7))
 

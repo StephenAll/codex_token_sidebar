@@ -23,6 +23,13 @@ import xml.etree.ElementTree as ET
 
 PACKAGE_NAME = "OpenAI.Codex"
 CDP_FLAGS = ("--remote-debugging-port=9222", "--remote-debugging-address=127.0.0.1")
+
+
+def launch_environment():
+    """Preserve caller settings without enabling performance diagnostics."""
+    return dict(os.environ)
+
+
 LAUNCHER_NAME = "codex_cdp.py"
 DESKTOP_LAUNCHER_NAME = "codex_cdp_desktop.pyw"
 COMMAND_NAME = "codex-cdp.cmd"
@@ -261,7 +268,7 @@ def launch_desktop() -> None:
             raise SetupError("Desktop 仍在运行；请从托盘完全退出后重试")
     _log_launch("starting")
     subprocess.Popen([str(executable), *CDP_FLAGS], stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=launch_environment())
     for _ in range(40):
         if has_desktop_page() and any(_has_cdp_flags(process)
                                       for process in main_processes(executable)):

@@ -22,7 +22,7 @@ from typing import Any
 
 from cdp_session import CdpError, CdpSession
 from usage import aggregate_events, parse_usage_text
-from usage_reader import UsageReader
+from usage_reader import UsageReader, PERFORMANCE_ENABLED
 from rate_sync import RateSync
 from rollout_discovery import RolloutCatalog
 from state_index import NativeStateIndex
@@ -97,6 +97,7 @@ def configure_logging(
 @lru_cache(maxsize=1)
 def _injector_bundle() -> tuple[str, str]:
     source = (Path(__file__).with_name("injector.js")).read_text(encoding="utf-8")
+    source = source.replace("__CODEX_TOKEN_SIDEBAR_PERFORMANCE__", json.dumps(PERFORMANCE_ENABLED))
     digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
     return source.replace("__CODEX_TOKEN_SIDEBAR_HASH__", json.dumps(digest)), digest
 
@@ -218,7 +219,12 @@ def create_reader() -> UsageReader:
     home = Path(configured).expanduser().absolute() if configured else Path.home() / ".codex"
     sessions = home / "sessions"
     index = NativeStateIndex(home / "state_5.sqlite", sessions) if mode == "auto" else None
-    return UsageReader(sessions, discoverer=RolloutCatalog(sessions, index=index))
+    timing_source = None
+    if PERFORMANCE_ENABLED:
+        from sampling_timing import DesktopTimingReader
+        timing_source = DesktopTimingReader()
+    return UsageReader(sessions, discoverer=RolloutCatalog(sessions, index=index),
+                       timing_source=timing_source, performance_enabled=PERFORMANCE_ENABLED)
 
 
 def run_daemon(interval: float, explicit_port: int | None, once: bool, *, stop_event=None, on_ready=None, on_health=None) -> int:

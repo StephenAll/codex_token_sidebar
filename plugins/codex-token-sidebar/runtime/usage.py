@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 from datetime import datetime, timezone
-from heapq import nlargest
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from typing import Any, Iterable
@@ -62,6 +61,38 @@ def _first_model(*objects: Any) -> str | None:
 
 def _identifier(value):
     return value if isinstance(value, str) and value else ""
+
+
+class RolloutIdentity:
+    """Keep a declared fork's owner separate from its inherited history segment."""
+
+    def __init__(self, execution_id):
+        self.execution_id = execution_id
+        self.context_id = execution_id
+        self.forked = False
+
+    def observe(self, entry):
+        kind, payload = entry.get("type"), entry.get("payload")
+        if not isinstance(payload, dict):
+            return self.context_id == self.execution_id
+        if kind == "session_meta":
+            identity = _identifier(payload.get("id"))
+            if identity:
+                self.context_id = identity
+                if not self.forked or identity == self.execution_id:
+                    self.execution_id = identity
+                    source = payload.get("source")
+                    subagent = source.get("subagent") if isinstance(source, dict) else None
+                    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+                    parents = (payload.get("forked_from_id"), payload.get("parent_thread_id"),
+                               spawn.get("parent_thread_id") if isinstance(spawn, dict) else None)
+                    self.forked |= any(_identifier(parent) and parent != identity for parent in parents)
+        elif (self.forked and kind == "event_msg"
+              and payload.get("type") == "thread_settings_applied"):
+            thread = _identifier(payload.get("thread_id"))
+            if thread:
+                self.context_id = thread
+        return self.context_id == self.execution_id
 
 
 def _model_evidence(models, turn, root_turn, *, owned=True, explicit=None):
@@ -255,6 +286,7 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
     current_model: str | None = None
     generation = 0
     thread_source = None
+    identity = RolloutIdentity(session_id)
 
     for line in text.splitlines():
         # Most rollout lines are messages, tool calls, or reasoning content.
@@ -265,6 +297,7 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
             and '"turn_context"' not in line
             and '"usage"' not in line
             and '"session_meta"' not in line
+            and '"thread_settings_applied"' not in line
         ):
             continue
         try:
@@ -274,10 +307,12 @@ def parse_usage_text(text: str, session_id: str) -> list[UsageEvent]:
         if not isinstance(entry, dict):
             continue
 
+        if not identity.observe(entry):
+            continue
+        session_id = identity.execution_id
         entry_type = entry.get("type")
         payload = entry.get("payload")
         if entry_type == "session_meta" and isinstance(payload, dict):
-            session_id = _identifier(payload.get("id")) or session_id
             thread_source = payload.get("thread_source") or payload.get("source")
             continue
         if entry_type == "turn_context" and isinstance(payload, dict):
@@ -373,6 +408,7 @@ def parse_usage_records(text: str, session_id: str, *, source_id: str | None = N
     model_by_turn: dict[str, set[str]] = defaultdict(set)
     thread_source: Any = None
     execution_id = session_id
+    identity = RolloutIdentity(session_id)
     raw_records: list[tuple[str, dict[str, Any]]] = []
 
     for line in text.splitlines():
@@ -380,6 +416,7 @@ def parse_usage_records(text: str, session_id: str, *, source_id: str | None = N
             '"token_usage_record"' not in line
             and '"turn_context"' not in line
             and '"session_meta"' not in line
+            and '"thread_settings_applied"' not in line
         ):
             continue
         try:
@@ -393,10 +430,12 @@ def parse_usage_records(text: str, session_id: str, *, source_id: str | None = N
             continue
 
         entry_type = entry.get("type")
+        owned_context = identity.observe(entry)
+        execution_id = identity.execution_id
+        if not owned_context and (entry_type != "token_usage_record" or not _identifier(payload.get("thread_id"))):
+            continue
         if entry_type == "session_meta":
             thread_source = payload.get("thread_source") or payload.get("source")
-            if isinstance(payload.get("id"), str) and payload["id"]:
-                execution_id = payload["id"]
         elif entry_type == "turn_context":
             turn_id = payload.get("turn_id")
             model = _first_model(payload)
@@ -607,7 +646,13 @@ class UsageAccumulator:
             self._count(self.model_requests.setdefault(item.model, Counter()), request, delta)
             if item.turn_id:
                 usage = self.turn_usage.setdefault(item.turn_id, {"output": 0, "invalid": 0,
-                                                               "conflicts": 0, "checkpoints": Counter()})
+                                                               "conflicts": 0, "checkpoints": Counter(), "models": Counter(),
+                                                               "responses": {}})
+                if delta > 0:
+                    usage["responses"][item.response_id] = item.output_tokens
+                else:
+                    usage["responses"].pop(item.response_id, None)
+                self._count(usage["models"], item.model, delta)
                 usage["output"] += item.output_tokens * delta
                 usage["invalid"] += delta * (not (item.output_tokens_known and item.identity_complete and item.metadata_owned))
                 usage["conflicts"] += delta * item.performance_conflict
@@ -842,9 +887,10 @@ def source_scope_reasons(thread, current, scopes, *, legacy=None):
 class UsageStream:
     """Line-oriented pure state; emits replacements/removals for changed keys.
 
-    Modern model/source metadata applies to the whole file. Keep the raw usage
-    contenders needed to reattribute anonymous records when their keys diverge
-    or converge after later metadata. Legacy cumulative state stays sequential.
+    Only the execution's own segments supply model/source metadata. Keep raw
+    usage contenders to reattribute records after later metadata. Inherited
+    segments contribute only responses with explicit execution identities.
+    Legacy cumulative state stays sequential.
     Ordinary message bodies are never retained.
     """
 
@@ -852,6 +898,7 @@ class UsageStream:
         self.session_id = session_id
         self.source_id = source_id or session_id
         self.execution_id = session_id
+        self._identity = RolloutIdentity(session_id)
         self.credits = CreditEvidence()
         self.scope = SourceScope(session_id)
         self.records: dict[tuple[Any, ...], UsageRecord] = {}
@@ -945,11 +992,15 @@ class UsageStream:
             return
         kind, payload = entry.get("type"), entry.get("payload")
         previous_execution = self.execution_id
+        owned_context = self._identity.observe(entry)
+        self.execution_id = self._identity.execution_id
+        # Explicit response identities can survive in inherited copies. Their
+        # surrounding model, tier, legacy counters and turn clocks cannot.
+        if not owned_context and (kind != "token_usage_record" or not _identifier(payload.get("thread_id"))):
+            return
         response_key = None
         if isinstance(payload, dict):
-            if kind == "session_meta":
-                self.execution_id = _identifier(payload.get("id")) or self.execution_id
-            elif kind == "token_usage_record":
+            if kind == "token_usage_record":
                 # Count even unusable records so both consumers share stable
                 # source-local identities when an anonymous response is skipped.
                 self._sequence += 1
@@ -1031,28 +1082,54 @@ class UsageStream:
         return changes
 
 
-def turn_performance(thread, current, streams):
+def turn_performance(thread, current, streams, sampling=None):
     """Join owned timing evidence to canonical turn totals, without pricing/UI state."""
     timings = defaultdict(list)
     for stream in streams:
         if stream.execution_id == thread and stream.scope.has_header:
             for turn, evidence in stream.turn_timings.items():
                 timings[turn].append(evidence)
-    result = {"windowSize": 10, "turns": [], "averageOutputTokensPerSecond": None,
-              "averageSampleCount": 0, "windowUnavailableReason": None}
-    completed = []
+    by_model = defaultdict(list)
+    excluded = {"mixedModel": 0, "unknownModel": 0}
     for turn, evidence in timings.items():
         completions = {e["complete"] for e in evidence if e["complete"] is not None}
         if not completions:
             continue
+        usage = current.turn_usage.get(turn) if current else None
+        models = set(usage["models"]) if usage else set()
+        if sampling:
+            models.update(sampling.models(turn))
+        if not models or "unknown" in models:
+            excluded["unknownModel"] += 1
+        elif len(models) > 1:
+            excluded["mixedModel"] += 1
+        else:
+            by_model[next(iter(models))].append((turn, evidence, completions))
+    windows = []
+    for model, evidence in by_model.items():
+        window = _model_turn_window(current, evidence, sampling)
+        window["model"] = model
+        windows.append(window)
+    windows.sort(key=lambda window: (window["turns"][-1]["completedAt"] if window["turns"] else "",
+                                     window["model"]), reverse=True)
+    return {"metric": "engine_iapi_sampling_interval", "selection": "complete_sampling", "windowSize": 10,
+            "byModel": windows, "excludedTurns": excluded}
+
+
+def _model_turn_window(current, evidence_by_turn, sampling):
+    """Only single-model turns share a denominator; mixed turns stay unallocated."""
+    result = {"windowSize": 10, "turns": [], "averageOutputTokensPerSecond": None,
+              "averageSampleCount": 0}
+    completed = []
+    for turn, evidence, completions in evidence_by_turn:
         dates = {e[0] for e in completions}
         if len(dates) != 1 or None in dates:
-            result["windowUnavailableReason"] = "completion_time_unconfirmed"
-            return result
+            continue
         completed.append((next(iter(dates)), turn, evidence, completions))
     output_sum = duration_sum = 0
-    for date, turn, evidence, completions in sorted(nlargest(10, completed, key=lambda row: (row[0], row[1])),
-                                                   key=lambda row: (row[0], row[1])):
+    # Validate newest turns first and stop after ten complete samples. Older
+    # response chains are only inspected when a newer turn cannot fill a slot.
+    for date, turn, evidence, completions in sorted(completed, key=lambda row: (row[0], row[1]), reverse=True):
         durations = {e[1] for e in completions}
         latencies = {e[2] for e in completions}
         duration = next(iter(durations)) if len(durations) == 1 else None
@@ -1075,15 +1152,24 @@ def turn_performance(thread, current, streams):
         elif not usage["checkpoints"] or max(usage["checkpoints"]) != usage["output"]:
             reason = "turn_usage_scope_unconfirmed"
         output = usage["output"] if usage and not usage["invalid"] else None
-        rate = output * 1000 / duration if reason is None else None
-        if rate is not None:
-            result["averageSampleCount"] += 1
-            output_sum += output
-            duration_sum += duration
+        measured = {}
+        if reason is None:
+            measured, reason = (sampling.measure(turn, usage["responses"]) if sampling
+                                else ({}, "sampling_timing_unavailable"))
+        if reason:
+            continue
+        rate = measured["samplingIntervals"] * 1000 / measured["samplingMs"]
+        result["averageSampleCount"] += 1
+        output_sum += measured["samplingIntervals"]
+        duration_sum += measured["samplingMs"]
         result["turns"].append({"turnId": turn, "completedAt": date,
             "outputTokens": output, "durationMs": duration,
+            "samplingIntervals": measured.get("samplingIntervals"), "samplingMs": measured.get("samplingMs"),
             "outputTokensPerSecond": rate, "firstTokenLatencyMs": latency if latency_reason is None else None,
             "rateUnavailableReason": reason, "latencyUnavailableReason": latency_reason})
+        if len(result["turns"]) == result["windowSize"]:
+            break
+    result["turns"].reverse()
     if duration_sum:
         result["averageOutputTokensPerSecond"] = output_sum * 1000 / duration_sum
     return result

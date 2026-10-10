@@ -21,6 +21,9 @@ from rollout_discovery import DiscoveryResult, RolloutCatalog, _session_id_from_
 
 LOGGER = logging.getLogger("codex-token-sidebar")
 
+# Restore only after upstream timing coverage has been validated.
+PERFORMANCE_ENABLED = False
+
 class _RolloutState:
     """Byte cursor and bounded boundary samples; retains no complete message text."""
 
@@ -67,13 +70,16 @@ class UsageReader:
         discovery_interval: float = 5.0,
         audit_interval: float = 30.0,
         discoverer: RolloutCatalog | None = None,
-        rate_card: dict | None = None, rate_source=None,
+        rate_card: dict | None = None, rate_source=None, timing_source=None,
+        performance_enabled: bool = PERFORMANCE_ENABLED,
     ) -> None:
         self.sessions_dir = sessions_dir or (Path.home() / ".codex" / "sessions")
         self._states: dict[str, _RolloutState] = {}
         self._credits = CreditsLedger(rate_card or bundled_card())
         self._credit_sources = {}
         self.rate_source = rate_source
+        self.performance_enabled = performance_enabled
+        self.timing_source = timing_source if performance_enabled else None
         self._rate_status = "bundled"
         self._rate_error = None
         self._contributors: tuple[dict, dict] = ({}, {})
@@ -218,6 +224,7 @@ class UsageReader:
         self._apply_credits(key, state.parser.credits.drain())
 
     def snapshot(self, session_id: str | None) -> dict[str, Any]:
+        timing_revision = self.timing_source.poll(session_id) if self.timing_source else None
         self._read_failed = False
         if self.rate_source is not None:
             card, status = self.rate_source.poll(bool(self._credits.reasons.get('no_public_model_rate')))
@@ -241,7 +248,7 @@ class UsageReader:
                 self._drop_file(str(path))
             except OSError:
                 self._read_failed = True
-        key = (session_id, tuple(signatures))
+        key = (session_id, tuple(signatures), timing_revision)
         due = any(state.needs_audit and self._clock() >= state.audit_after
                   for state in self._states.values())
         if key == self._snapshot_key and self._snapshot is not None and not self._read_failed and not due:
@@ -278,8 +285,11 @@ class UsageReader:
             "status": "ok" if session_id and (modern.threads or legacy.threads) else "waiting",
             "conversationId": session_id,
             "session": summary["total"],
+            "sessionLatestPerformance": self.timing_source.latest(modern.threads.get(session_id))
+                                      if self.timing_source else None,
             "sessionTurnPerformance": turn_performance(session_id, modern.threads.get(session_id),
-                                                       (state.parser for state in self._states.values())),
+                                                       (state.parser for state in self._states.values()),
+                                                       self.timing_source) if self.performance_enabled else None,
             "sessionCredits": credit_report,
             "sessionUsageCompleteness": summary["completeness"],
             "sessionByFeature": summary["by_feature"],

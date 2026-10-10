@@ -58,7 +58,7 @@ def main(*, diagnose: bool = False) -> None:
 
     process = subprocess.Popen([str(executable), *setup.CDP_FLAGS],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
+                               stderr=subprocess.DEVNULL, env=setup.launch_environment())
     log(f"started Desktop pid={process.pid}")
     for _ in range(40):
         if (setup.has_desktop_page()

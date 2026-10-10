@@ -26,6 +26,7 @@
 
    上述脚本只配置启动入口，不会改变已运行的 Desktop。请用户**完全退出**后按所选方式重开；集成终端会随 Desktop 退出，不能用它执行重启命令。若 Desktop 设为开机自动启动，也应改用所选入口，避免普通启动抢先占用进程。重开后由 Agent 复查 `/json/list` 中的 Desktop 主页面；若未出现，先核对是否从所选入口启动，再继续下一步。
 
+
 3. **触发并验收 Hook。** 先运行 `plugins/codex-token-sidebar/scripts/stop_sidebar.sh --json`，避免旧实例掩盖启动失败。请用户新建 Codex 任务；若出现 `codex-token-sidebar@stephen` 的 Hook 审查提示，由用户确认信任后再新建任务。选中已有用量的任务，检查侧栏和状态：
 
    ```sh

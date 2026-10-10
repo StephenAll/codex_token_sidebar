@@ -56,6 +56,11 @@ def is_main_url(value: str) -> bool:
             path = route.split("?", 1)[0].split("#", 1)[0]
             if "%" in path or any(path == prefix or path.startswith(prefix + "/") for prefix in AUXILIARY_ROUTES):
                 return False
+            # Dedicated Page windows share index.html, including hidden prewarms.
+            # Their Electron shell does not make them a chat mounting target.
+            route_query = parse_qs(urlparse(route).query, keep_blank_values=True)
+            if (path == "/space" or path.startswith("/space/")) and "page" in route_query.get("window", []):
+                return False
         return True
     except ValueError:
         return False

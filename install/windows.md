@@ -77,6 +77,7 @@ py -3 -c "import sys; assert sys.version_info >= (3, 10), sys.version"
 
    两个入口都会在每次启动时重新定位当前 `OpenAI.Codex` 包内的主程序；若普通实例正在运行，先请用户从托盘完全退出，桌面启动器会显示错误对话框而不会闪退。脚本用主进程的 CDP 参数和 `/json/list` 主页面共同验收。若 Desktop 设为开机自动启动，应改用所选入口。重开后 Agent 再复查 `/json/list` 和主进程 CDP 参数，确认从所选入口启动，才继续下一步。
 
+
 3. **触发并验收 Hook。** 先运行 `py -3 plugins/codex-token-sidebar/runtime/windows_lifecycle.py stop --json`，避免旧实例掩盖启动失败。请用户新建 Codex 任务；若出现 `codex-token-sidebar@stephen` 的 Hook 审查提示，由用户确认信任后再新建任务。选中已有用量的任务，检查侧栏和状态：
 
    ```powershell

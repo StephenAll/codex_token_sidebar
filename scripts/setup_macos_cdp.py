@@ -15,7 +15,8 @@ import tempfile
 
 
 BUNDLE_ID = "com.openai.codex"
-OPEN_COMMAND = (f"/usr/bin/open -b {BUNDLE_ID} --args "
+OPEN_COMMAND = (f"/usr/bin/open -b {BUNDLE_ID} "
+                "--args "
                 "--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1")
 CHECK_COMMAND = ("/usr/bin/curl -fsS --max-time 1 http://127.0.0.1:9222/json/list "
                  "2>/dev/null | /usr/bin/grep -Eq 'app://-/index[.]html'")

@@ -22,4 +22,5 @@ dist/
 
 # Browser acceptance dependencies and generated evidence
 tests/browser/node_modules/
-output/playwright/
+output/
+outputs/
